@@ -1,8 +1,4 @@
-# ANÁLISIS DEL COEFICIENTE DE VARIACIÓN
-# Fecha: [Fecha actual]
-
-# 1. CREACIÓN DE UN CONJUNTO DE DATOS SIMULADO (100 registros, 6 variables)
-set.seed(123) # Para reproducibilidad
+set.seed(123) 
 
 n <- 100
 datos <- data.frame(
@@ -38,8 +34,9 @@ print(resultados_cv)
 for (var in names(datos)) {
   cat("\n---", var, "---\n")
   cat("Media:", round(mean(datos[[var]], na.rm = TRUE), 2), "\n")
-  cat("Desviación estándar:", round(sd(datos[[var]], na.rm = TRUE), 2), "\n")
-  cat("Coeficiente de variación:", calcular_cv(datos[[var]]), "%\n")
-  cat("Mínimo:", min(datos[[var]], na.rm = TRUE), "\n")
-  cat("Máximo:", max(datos[[var]], na.rm = TRUE), "\n")
+  cat("DesviaciÃ³n estÃ¡ndar:", round(sd(datos[[var]], na.rm = TRUE), 2), "\n")
+  cat("Coeficiente de variaciÃ³n:", calcular_cv(datos[[var]]), "%\n")
+  cat("MÃ­nimo:", min(datos[[var]], na.rm = TRUE), "\n")
+  cat("MÃ¡ximo:", max(datos[[var]], na.rm = TRUE), "\n")
 }
+
