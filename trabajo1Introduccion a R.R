@@ -40,3 +40,4 @@ for (var in names(datos)) {
   cat("Máximo:", max(datos[[var]], na.rm = TRUE), "\n")
 }
 
+
