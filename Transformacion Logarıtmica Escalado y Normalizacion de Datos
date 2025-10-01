@@ -1,0 +1,46 @@
+# ============================================================================
+#  Transformación logarítmica + escalado/normalización
+#  Ejemplo completo y autocontenido
+# ============================================================================
+
+# --- paquetes ---------------------------------------------------------------
+# (solo necesitas R-base; descomenta si usas tidyverse)
+# library(tidyverse)
+# library(caret)
+
+# --- datos sesgados (ejemplo) -----------------------------------------------
+set.seed(123)
+x <- rexp(100, rate = 0.2)   # exponencial => cola derecha
+
+# --- transformación logarítmica ---------------------------------------------
+# Opción 1: datos estrictamente positivos
+x_log <- log(x)
+
+# Opción 2: si hubiera ceros o negativos
+# x_log <- log(x + 1)                       # corrimiento simple
+# x_log <- log(x - min(x) + 1)              # corrimiento robusto
+
+# --- visualización ----------------------------------------------------------
+par(mfrow = c(1, 2))
+hist(x,      breaks = 15, col = "skyblue", main = "Original", xlab = "x")
+hist(x_log, breaks = 15, col = "tomato",  main = "Log(x)",   xlab = "log(x)")
+par(mfrow = c(1, 1))
+
+# --- prueba de normalidad ---------------------------------------------------
+shapiro.test(x)      # p-valor pequeño → rechazo de normalidad
+shapiro.test(x_log)  # p-valor más alto → mejor aprox. normal
+
+# --- escalado y normalización post-log -------------------------------------
+# Z-score (media 0, varianza 1)
+x_log_z <- scale(x_log)
+
+# Min-Max (0-1)
+x_log_mm <- (x_log - min(x_log)) / (max(x_log) - min(x_log))
+
+# --- resumen ----------------------------------------------------------------
+data.frame(
+  Original      = c(media = mean(x),      var = var(x),      min = min(x),      max = max(x)),
+  Logaritmica   = c(media = mean(x_log),  var = var(x_log),  min = min(x_log),  max = max(x_log)),
+  Log_Zscore    = c(media = mean(x_log_z),var = var(x_log_z),min = min(x_log_z),max = max(x_log_z)),
+  Log_MinMax    = c(media = mean(x_log_mm),var = var(x_log_mm),min = min(x_log_mm),max = max(x_log_mm))
+)
