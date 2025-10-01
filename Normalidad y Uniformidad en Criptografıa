@@ -30,7 +30,7 @@ chisq.test(table(bits), p = c(0.5,0.5))
 
 
 # ==============================
-# CÓDIGO COMPLETO JUNTO
+# CÓDIGO COMPLETO
 # ==============================
 pwds <- c("P@ssw0rd!", "clave2025", "12345678", "MiClave#1")
 len_bits <- nchar(pwds) * 8
