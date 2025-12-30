@@ -1,0 +1,4919 @@
+# ============================================
+# APP SHINY AVANZADA - MODELADO DE EVENTOS EXTREMOS DE PRECIPITACIÓN
+# ============================================
+
+# 1. PAQUETES NECESARIOS
+library(shiny)
+library(shinydashboard)
+library(shinyWidgets)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(readxl)
+library(fitdistrplus)
+library(evd)
+library(goftest)
+library(boot)
+library(DT)
+library(extRemes)
+
+# 2. FUNCIONES ESPECIALIZADAS PARA ANÁLISIS DE EXTREMOS
+#source("funciones_extremos.R", local = TRUE, encoding = "UTF-8")
+
+# Función para normalizar nombres de columnas
+normalizar_nombres <- function(nombres) {
+  nombres <- tolower(nombres)
+  nombres <- gsub("\\s+", "_", nombres)
+  nombres <- iconv(nombres, from = "UTF-8", to = "ASCII//TRANSLIT")
+  nombres <- gsub("[^a-z0-9_]", "", nombres)
+  return(nombres)
+}
+
+# Función Power Lindley (distribución de cola pesada)
+dpowlindley <- function(x, alpha, beta) {
+  if(alpha <= 0 | beta <= 0 | any(x < 0)) return(rep(NA, length(x)))
+  term1 <- (alpha * beta^2) / (1 + beta)
+  term2 <- (1 + x) * x^(alpha - 1)
+  term3 <- exp(-beta * x^alpha)
+  return(term1 * term2 * term3)
+}
+
+ppowlindley <- function(q, alpha, beta) {
+  if(alpha <= 0 | beta <= 0) return(rep(NA, length(q)))
+  1 - (1 + (beta/(1+beta)) * q^alpha) * exp(-beta * q^alpha)
+}
+
+# Función Zeghdoudi (otra distribución de cola pesada)
+dzeghdoudi <- function(x, alpha, lambda) {
+  if(alpha <= 0 | lambda <= 0) return(rep(NA, length(x)))
+  term1 <- (alpha * lambda^alpha)
+  term2 <- x^(-(alpha + 1))
+  term3 <- exp(-(lambda/x)^alpha)
+  return(term1 * term2 * term3)
+}
+
+pzeghdoudi <- function(q, alpha, lambda) {
+  if(alpha <= 0 | lambda <= 0) return(rep(NA, length(q)))
+  exp(-(lambda/q)^alpha)
+}
+
+# 3. UI DE LA APLICACIÓN
+ui <- dashboardPage(
+  dashboardHeader(
+    title = tags$div(
+      tags$img(src = "https://cdn-icons-png.flaticon.com/512/414/414927.png", 
+               height = "30px", style = "margin-right: 10px;"),
+      "Modelado de Eventos Extremos - Puno"
+    ),
+    titleWidth = 400
+  ),
+  
+  dashboardSidebar(
+    width = 350,
+    sidebarMenu(
+      id = "tabs",
+      menuItem("📊 Carga de Datos", tabName = "datos", icon = icon("upload")),
+      menuItem("📈 Análisis Exploratorio", tabName = "exploratorio", icon = icon("chart-line")),
+      menuItem("📉 Ajuste de Distribuciones", tabName = "distribuciones", icon = icon("chart-area")),
+      menuItem("🎯 Comparación de Modelos", tabName = "comparacion", icon = icon("balance-scale")),
+      menuItem("🔄 Análisis Bootstrap", tabName = "bootstrap", icon = icon("retweet")),
+      menuItem("📋 Pronóstiles de Diseño", tabName = "pronostiles", icon = icon("ruler")),
+      menuItem("📄 Reporte Técnico", tabName = "reporte", icon = icon("file-pdf"))
+    ),
+    
+    # Panel de control que cambia según la pestaña
+    conditionalPanel(
+      condition = "input.tabs == 'datos'",
+      box(
+        title = "Configuración de Datos",
+        status = "primary",
+        solidHeader = TRUE,
+        width = NULL,
+        collapsible = FALSE,
+        
+        fileInput("archivo", "Subir Archivo de Precipitación",
+                  accept = c(".xlsx", ".xls", ".csv"),
+                  buttonLabel = "Buscar...",
+                  placeholder = "Selecciona un archivo"),
+        
+        selectInput("formato", "Formato del Archivo:",
+                    choices = c("Excel (.xlsx/.xls)" = "excel",
+                                "CSV" = "csv"),
+                    selected = "excel"),
+        
+        conditionalPanel(
+          condition = "input.formato == 'csv'",
+          textInput("separador", "Separador:", value = ","),
+          checkboxInput("header", "Incluye encabezado", TRUE)
+        ),
+        
+        dateRangeInput("rango_fechas", "Rango de Fechas:",
+                       start = "2004-01-01",
+                       end = "2024-12-31",
+                       format = "dd/mm/yyyy",
+                       language = "es"),
+        
+        selectInput("estacion", "Estación Meteorológica:",
+                    choices = c("Estación Puno", "Estación Juli", 
+                                "Estación Ilave", "Estación Desaguadero",
+                                "Estación Azangaro"),
+                    selected = "Estación Puno"),
+        
+        actionButton("procesar", "Procesar Datos",
+                     icon = icon("cogs"),
+                     class = "btn-success",
+                     width = "100%")
+      )
+    ),
+    
+    conditionalPanel(
+      condition = "input.tabs == 'distribuciones'",
+      box(
+        title = "Selección de Distribuciones",
+        status = "warning",
+        solidHeader = TRUE,
+        width = NULL,
+        collapsible = FALSE,
+        
+        # Fondo gris plomo para toda la caja
+        style = "background-color: #2c3e50; color: white;",
+        
+        # CSS para asegurar que todo sea visible
+        tags$head(tags$style(HTML("
+      /* Estilo para el box de distribuciones */
+      .box-warning[style*='background-color: #2c3e50'] .form-group label,
+      .box-warning[style*='background-color: #2c3e50'] .awesome-checkbox-group label,
+      .box-warning[style*='background-color: #2c3e50'] .shiny-input-container {
+        color: white !important;
+      }
+      
+      /* Estilo específico para los checkboxes */
+      .box-warning[style*='background-color: #2c3e50'] .awesome-checkbox-group .checkbox-primary span {
+        color: white !important;
+      }
+      .box-warning[style*='background-color: #2c3e50'] .awesome-checkbox-group .checkbox-danger span {
+        color: white !important;
+      }
+      
+      /* Slider personalizado para fondo oscuro */
+      .box-warning[style*='background-color: #2c3e50'] .irs--shiny .irs-bar,
+      .box-warning[style*='background-color: #2c3e50'] .irs--shiny .irs-line {
+        background: #7f8c8d;
+      }
+      .box-warning[style*='background-color: #2c3e50'] .irs--shiny .irs-handle {
+        border-color: #3498db;
+      }
+      .box-warning[style*='background-color: #2c3e50'] .irs--shiny .irs-single,
+      .box-warning[style*='background-color: #2c3e50'] .irs--shiny .irs-min,
+      .box-warning[style*='background-color: #2c3e50'] .irs--shiny .irs-max {
+        color: white;
+        background: #34495e;
+      }
+    "))),
+        
+        h5("Distribuciones Clásicas:", style = "color: #ecf0f1; font-weight: bold; margin-top: 10px;"),
+        awesomeCheckboxGroup(
+          inputId = "dist_clasicas",
+          label = NULL,
+          choices = c("Generalizada de Valores Extremos (GEV)" = "gev",
+                      "Gumbel" = "gumbel",
+                      "Gamma" = "gamma"),
+          selected = c("gev", "gumbel", "gamma"),
+          status = "primary"
+        ),
+        
+        h5("Distribuciones de Cola Pesada:", style = "color: #ecf0f1; font-weight: bold; margin-top: 15px;"),
+        awesomeCheckboxGroup(
+          inputId = "dist_colapesada",
+          label = NULL,
+          choices = c("Power Lindley" = "powerlindley",
+                      "Zeghdoudi" = "zeghdoudi",
+                      "Log-Normal" = "lognormal",
+                      "Weibull" = "weibull"),
+          selected = c("powerlindley", "zeghdoudi"),
+          status = "danger"
+        ),
+        
+        # Slider con etiqueta blanca
+        tags$div(style = "margin-top: 20px;",
+                 tags$label("Nivel de Confianza (%):", 
+                            style = "color: white; font-weight: bold; display: block; margin-bottom: 10px;"),
+                 sliderInput("confianza", 
+                             label = NULL,  # Label ya lo pusimos arriba
+                             min = 80, max = 99, value = 95, step = 1)
+        ),
+        
+        # Botón que contrasta con el fondo oscuro
+        tags$div(style = "margin-top: 20px;",
+                 actionButton("ajustar_dist", "Ajustar Distribuciones",
+                              icon = icon("calculator"),
+                              class = "btn-info",
+                              style = "background-color: #3498db; border-color: #2980b9; color: white; font-weight: bold; width: 100%;")
+        )
+      )
+    ),
+    
+    conditionalPanel(
+      condition = "input.tabs == 'bootstrap'",
+      box(
+        title = "Configuración Bootstrap",
+        status = "info",
+        solidHeader = TRUE,
+        width = NULL,
+        collapsible = FALSE,
+        style = "background-color: #00008B;",
+        
+        numericInput("n_bootstrap", "Número de Réplicas Bootstrap:",
+                     value = 1000, min = 100, max = 10000, step = 100),
+        
+        selectInput("dist_bootstrap", "Distribución para Bootstrap:",
+                    choices = c("GEV", "Gumbel", "Gamma", 
+                                "Power Lindley", "Zeghdoudi"),
+                    selected = "Gumbel"),
+        
+        sliderInput("confianza_bootstrap", "Nivel de Confianza (%):",
+                    min = 80, max = 99, value = 95, step = 1),
+        
+        selectInput("parametro_bootstrap", "Parámetro a visualizar:",
+                    choices = c("Todos" = "todos",
+                                "Parámetro 1" = "param1",
+                                "Parámetro 2" = "param2",
+                                "Parámetro 3" = "param3"),
+                    selected = "todos"),
+        
+        numericInput("tamanio_muestra_bootstrap", 
+                     "Tamaño de muestra para convergencia:",
+                     value = 100, min = 10, max = 1000, step = 10),
+        
+        selectInput("metodo_intervalo_bootstrap", "Método para intervalos:",
+                    choices = c("Percentil" = "percentile",
+                                "BCa (Bias-Corrected)" = "bca",
+                                "Normal" = "normal"),
+                    selected = "percentile"),
+        
+        checkboxInput("mostrar_densidad_bootstrap", "Mostrar densidad", TRUE),
+        checkboxInput("error_estandar_bootstrap", "Mostrar error estándar", TRUE),
+        
+        actionButton("ejecutar_bootstrap", "Ejecutar Bootstrap",
+                     icon = icon("spinner"),
+                     class = "btn-warning",
+                     width = "100%"),
+        
+        actionButton("verificar_datos", "Verificar Datos",
+                     icon = icon("search"),
+                     class = "btn-info",
+                     style = "width: 100%; margin-top: 10px;"),
+        
+        tags$hr(),
+        
+        h5("Estado de los Datos:"),
+        verbatimTextOutput("estado_datos_bootstrap"),
+        
+        tags$hr(),
+        
+        h5("Información del Bootstrap:"),
+        verbatimTextOutput("info_bootstrap")
+      )
+    ),
+    
+    conditionalPanel(
+      condition = "input.tabs == 'pronostiles'",
+      box(
+        title = "Configuración de Pronóstiles",
+        status = "success",
+        solidHeader = TRUE,
+        width = NULL,
+        collapsible = FALSE,
+        
+        # Fondo verde para consistencia
+        style = "background-color: #00008B; border-left: 5px solid #4caf50;",
+        
+        selectInput("periodos_retorno", "Períodos de Retorno (años):",
+                    choices = c(2, 5, 10, 20, 50, 100),
+                    selected = c(2, 5, 10, 20, 50, 100),
+                    multiple = TRUE),
+        
+        selectInput("dist_pronostiles", "Distribución para Pronóstiles:",
+                    choices = c("MEJOR AJUSTE" = "mejor",
+                                "GEV" = "gev",
+                                "Gumbel" = "gumbel",
+                                "Gamma" = "gamma",
+                                "Power Lindley" = "powerlindley",
+                                "Zeghdoudi" = "zeghdoudi"),
+                    selected = "mejor"),
+        
+        checkboxInput("incluir_ic", "Incluir Intervalos de Confianza", TRUE),
+        
+        numericInput("alpha_riesgo", "Nivel de Riesgo α:", 
+                     value = 0.05, min = 0.001, max = 0.2, step = 0.001),
+        
+        downloadButton("descargar_pronostiles", "Descargar Tabla",
+                       class = "btn-primary",
+                       style = "width: 100%; background-color: #4caf50; 
+                          border-color: #388e3c; color: white;")
+      )
+    )
+  ),
+  
+  dashboardBody(
+    # CSS personalizado
+    tags$head(
+      tags$style(HTML("
+        /* Estilos generales */
+        .content-wrapper, .right-side {
+          background-color: #f4f6f9;
+        }
+        
+        .box {
+          border-radius: 8px;
+          box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        /* Estilos para gráficos */
+        .plot-container {
+          background-color: white;
+          padding: 15px;
+          border-radius: 5px;
+          margin-bottom: 15px;
+        }
+        
+        /* Estilos para tablas */
+        .dataTables_wrapper {
+          font-size: 13px;
+        }
+        
+        /* Colores para distribuciones */
+        .dist-gev { color: #e74c3c; }
+        .dist-gumbel { color: #3498db; }
+        .dist-gamma { color: #2ecc71; }
+        .dist-powerlindley { color: #9b59b6; }
+        .dist-zeghdoudi { color: #f39c12; }
+        
+        /* Animaciones */
+        .fade-in {
+          animation: fadeIn 0.5s;
+        }
+        
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+      "))
+    ),
+    
+    tabItems(
+      # ============================================
+      # TAB 1: CARGA DE DATOS
+      # ============================================
+      tabItem(
+        tabName = "datos",
+        fluidRow(
+          box(
+            title = "Estado del Sistema",
+            status = "success",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = FALSE,
+            
+            uiOutput("mensaje_bienvenida"),
+            
+            conditionalPanel(
+              condition = "output.datos_cargados == true",
+              tags$hr(),
+              h4("Resumen de Datos Cargados:"),
+              tableOutput("resumen_datos")
+            )
+          )
+        ),
+        
+        conditionalPanel(
+          condition = "output.datos_cargados == true",
+          fluidRow(
+            box(
+              title = "Vista Previa de los Datos",
+              status = "primary",
+              solidHeader = TRUE,
+              width = 12,
+              collapsible = TRUE,
+              
+              DTOutput("tabla_datos"),
+              tags$hr(),
+              tags$p("Total de registros: ", textOutput("n_registros", inline = TRUE),
+                     style = "font-weight: bold; color: #2c3e50;")
+            )
+          )
+        )
+      ),
+      
+      # ============================================
+      # TAB 2: ANÁLISIS EXPLORATORIO - CORREGIDO
+      # ============================================
+      tabItem(
+        tabName = "exploratorio",
+        fluidRow(
+          box(
+            title = "Serie Temporal de Precipitación Máxima Anual",
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            
+            plotOutput("serie_temporal", height = "400px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(4,
+                     sliderInput("suavizado", "Suavizado de la serie:",
+                                 min = 0, max = 1, value = 0.3, step = 0.05)
+              ),
+              column(4,
+                     checkboxInput("tendencia", "Mostrar tendencia", TRUE),
+                     checkboxInput("media_movil", "Media móvil (3 años)", FALSE)
+              ),
+              column(4,
+                     numericInput("anios_media_movil", "Años para media móvil:",
+                                  value = 3, min = 2, max = 10, step = 1)
+              )
+            )
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Estadísticas Descriptivas",
+            status = "warning",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            tableOutput("estadisticas_descriptivas"),
+            tags$hr(),
+            plotOutput("boxplot_anual", height = "250px")
+          ),
+          
+          box(
+            title = "Distribución de Frecuencias",
+            status = "info",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            plotOutput("histograma", height = "400px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(6,
+                     sliderInput("bins", "Número de intervalos (bins):",
+                                 min = 5, max = 30, value = 15, step = 1)
+              ),
+              column(6,
+                     checkboxInput("mostrar_densidad", "Mostrar densidad", TRUE),
+                     checkboxInput("mostrar_media", "Mostrar media", TRUE),
+                     checkboxInput("mostrar_mediana", "Mostrar mediana", TRUE)
+              )
+            )
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Pruebas de Normalidad y Homogeneidad",
+            status = "danger",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            collapsed = TRUE,
+            
+            fluidRow(
+              column(6,
+                     h4("Pruebas de Normalidad:"),
+                     verbatimTextOutput("pruebas_normalidad")
+              ),
+              column(6,
+                     h4("Pruebas de Estacionariedad:"),
+                     verbatimTextOutput("pruebas_estacionariedad")
+              )
+            )
+          )
+        )
+      ),
+      # ============================================
+      # TAB 3: AJUSTE DE DISTRIBUCIONES
+      # ============================================
+      tabItem(
+        tabName = "distribuciones",
+        fluidRow(
+          box(
+            title = "Comparación Visual de Distribuciones Ajustadas",
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            
+            plotOutput("grafico_ajuste", height = "500px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(4,
+                     selectInput("tipo_grafico", "Tipo de Gráfico:",
+                                 choices = c("Densidad" = "densidad",
+                                             "Distribución Acumulada" = "cdf",
+                                             "Q-Q Plot" = "qq",
+                                             "P-P Plot" = "pp"),
+                                 selected = "densidad")
+              ),
+              column(4,
+                     checkboxInput("mostrar_empirica", "Mostrar distribución empírica", TRUE),
+                     checkboxInput("mostrar_leyenda", "Mostrar leyenda", TRUE)
+              ),
+              column(4,
+                     numericInput("limite_superior", "Límite superior (mm):",
+                                  value = 150, min = 50, max = 500, step = 10)
+              )
+            )
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Parámetros Estimados",
+            status = "warning",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            DTOutput("tabla_parametros")
+          ),
+          
+          box(
+            title = "Pruebas de Bondad de Ajuste",
+            status = "info",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            DTOutput("tabla_bondad_ajuste")
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Análisis de Colas",
+            status = "danger",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            collapsed = TRUE,
+            
+            plotOutput("grafico_colas", height = "400px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(6,
+                     sliderInput("percentil_cola", "Percentil para análisis de colas:",
+                                 min = 0.90, max = 0.99, value = 0.95, step = 0.01)
+              ),
+              column(6,
+                     numericInput("exceso_cola", "Umbral para exceso sobre umbral:",
+                                  value = 50, min = 10, max = 200, step = 5)
+              )
+            )
+          )
+          
+        )
+      ),
+      
+      # ============================================
+      # TAB 4: COMPARACIÓN DE MODELOS
+      # ============================================
+      tabItem(
+        tabName = "comparacion",
+        fluidRow(
+          box(
+            title = "Criterios de Información (AIC/BIC)",
+            status = "primary",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            plotOutput("grafico_criterios", height = "350px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(6,
+                     radioButtons("criterio_comparacion", "Criterio de comparación:",
+                                  choices = c("AIC" = "aic", "BIC" = "bic"),
+                                  selected = "aic", inline = TRUE)
+              ),
+              column(6,
+                     checkboxInput("ordenar_criterios", "Ordenar por mejor ajuste", TRUE),
+                     checkboxInput("mostrar_valores", "Mostrar valores", TRUE)
+              )
+            )
+          ),
+          
+          box(
+            title = "Ranking de Modelos",
+            status = "warning",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            DTOutput("tabla_ranking"),
+            
+            tags$hr(),
+            
+            tags$div(
+              class = "alert alert-success",
+              tags$h5(icon("trophy"), " Mejor Modelo según AIC:"),
+              textOutput("mejor_modelo_aic", inline = TRUE),
+              tags$br(),
+              tags$h5(icon("award"), " Mejor Modelo según BIC:"),
+              textOutput("mejor_modelo_bic", inline = TRUE)
+            )
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Comparación de Cuantiles",
+            status = "info",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            
+            plotOutput("grafico_cuantiles", height = "400px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(4,
+                     sliderInput("rango_cuantiles", "Rango de probabilidades:",
+                                 min = 0.80, max = 0.999, value = c(0.90, 0.99), step = 0.001)
+              ),
+              column(4,
+                     checkboxInput("log_scale", "Escala logarítmica en eje Y", FALSE),
+                     checkboxInput("mostrar_empiricos", "Mostrar cuantiles empíricos", TRUE)
+              ),
+              column(4,
+                     numericInput("paso_cuantiles", "Paso para cuantiles:",
+                                  value = 0.01, min = 0.001, max = 0.05, step = 0.001),
+                     selectInput("tipo_cuantil", "Tipo de cuantil:",
+                                 choices = c("Teórico" = "teorico", "Empírico" = "empirico"),
+                                 selected = "teorico")
+              )
+            )
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Análisis de Riesgo Residual",
+            status = "danger",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            collapsed = TRUE,
+            
+            plotOutput("grafico_riesgo_residual", height = "350px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(4,
+                     selectInput("tipo_residual", "Tipo de residual:",
+                                 choices = c("Probabilidades" = "probability",
+                                             "Cuantiles" = "quantile",
+                                             "Score" = "score"),
+                                 selected = "probability")
+              ),
+              column(4,
+                     checkboxInput("qqplot_residual", "QQ-Plot de residuales", TRUE),
+                     checkboxInput("hist_residual", "Histograma de residuales", FALSE)
+              ),
+              column(4,
+                     numericInput("bandas_residual", "Bandas de confianza (%):",
+                                  value = 95, min = 80, max = 99.9, step = 1),
+                     actionButton("calcular_residuales", "Calcular Residuales",
+                                  icon = icon("calculator"), class = "btn-sm btn-info"),
+                     tags$hr(),
+                     verbatimTextOutput("estadisticas_residuales")
+              )
+            )
+          )
+        )
+      ),
+      
+      
+      # ============================================
+      # TAB 5: ANÁLISIS BOOTSTRAP (AGREGAR ESTA SECCIÓN)
+      # ============================================
+      tabItem(
+        tabName = "bootstrap",
+        fluidRow(
+          box(
+            title = "Distribución Bootstrap de Parámetros",
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            
+            plotOutput("distribucion_bootstrap", height = "400px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(4,
+                     selectInput("tipo_grafico_bootstrap", "Tipo de Gráfico:",
+                                 choices = c("Histograma" = "hist",
+                                             "Densidad" = "dens",
+                                             "QQ-Plot" = "qq"),
+                                 selected = "hist")
+              ),
+              column(4,
+                     checkboxInput("intervalos_confianza", "Mostrar intervalos de confianza", TRUE),
+                     checkboxInput("valores_estimados", "Mostrar valores estimados", TRUE)
+              ),
+              column(4,
+                     numericInput("bins_bootstrap", "Número de bins (histograma):",
+                                  value = 30, min = 10, max = 100, step = 5)
+              )
+            )
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Convergencia Bootstrap",
+            status = "warning",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            plotOutput("grafico_convergencia", height = "350px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(6,
+                     checkboxInput("linea_convergencia", "Línea de convergencia", TRUE)
+              ),
+              column(6,
+                     checkboxInput("bandas_error", "Bandas de error", FALSE)
+              )
+            )
+          ),
+          
+          box(
+            title = "Estadísticas Bootstrap",
+            status = "info",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            tableOutput("tabla_estadisticas_bootstrap"),
+            
+            tags$hr(),
+            
+            tags$div(
+              class = "alert alert-info",
+              tags$p(icon("info-circle"), " Los intervalos de confianza se calculan usando el método percentil bootstrap.")
+            )
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Intervalos de Confianza Bootstrap",
+            status = "success",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            
+            DTOutput("tabla_intervalos_bootstrap"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(6,
+                     downloadButton("descargar_bootstrap", "Descargar Resultados",
+                                    class = "btn-primary")
+              ),
+              column(6,
+                     actionButton("analizar_convergencia", "Analizar Convergencia",
+                                  icon = icon("chart-line"),
+                                  class = "btn-warning")
+              )
+            )
+          )
+        )
+      ),
+      
+      # ============================================
+      # TAB 6: PRONÓSTILES DE DISEÑO
+      # ============================================
+      tabItem(
+        tabName = "pronostiles",
+        fluidRow(
+          box(
+            title = "Pronóstiles de Diseño",
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = TRUE,
+            
+            DTOutput("tabla_pronostiles")
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Curva IDF (Intensidad-Duración-Frecuencia)",
+            status = "warning",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            plotOutput("grafico_idf", height = "350px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(6,
+                     numericInput("duracion_idf", "Duración (horas):",
+                                  value = 24, min = 1, max = 168, step = 1)
+              ),
+              column(6,
+                     checkboxInput("escala_log_idf", "Escala logarítmica", FALSE)
+              )
+            )
+          ),
+          
+          box(
+            title = "Análisis de Riesgo",
+            status = "danger",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            plotOutput("mapa_riesgo", height = "350px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(6,
+                     selectInput("nivel_riesgo", "Nivel de Riesgo:",
+                                 choices = c("bajo", "moderado", "alto", "muy_alto"),
+                                 selected = "moderado")
+              ),
+              column(6,
+                     selectInput("tipo_estructura", "Tipo de Estructura:",
+                                 choices = c("drenaje", "embalse", "bordo", "conduccion"),
+                                 selected = "drenaje")
+              )
+            )
+          )
+        ),
+        
+        fluidRow(
+          box(
+            title = "Análisis de Incertidumbre",
+            status = "info",
+            solidHeader = TRUE,
+            width = 6,
+            collapsible = TRUE,
+            
+            plotOutput("grafico_incertidumbre", height = "350px"),
+            
+            tags$hr(),
+            
+            fluidRow(
+              column(6,
+                     sliderInput("bandas_incertidumbre", "Bandas de incertidumbre (%):",
+                                 min = 5, max = 50, value = 20, step = 5)
+              ),
+              column(6,
+                     checkboxInput("mostrar_datos", "Mostrar datos", TRUE),
+                     numericInput("vida_util", "Vida útil de obra (años):",
+                                  value = 50, min = 5, max = 100, step = 5)
+              )
+            )
+          ),
+          
+        )
+      ),
+      
+      tabItem(
+        tabName = "reporte",
+        fluidRow(
+          box(
+            title = "Generador de Reporte Técnico",
+            status = "primary",
+            solidHeader = TRUE,
+            width = 12,
+            collapsible = FALSE,
+            
+            h4("Configuración del Reporte PDF"),
+            
+            fluidRow(
+              column(4,
+                     textInput("titulo_reporte", "Título del Reporte:",
+                               value = "Análisis de Eventos Extremos de Precipitación"),
+                     textInput("autor_reporte", "Autor:", value = "Ing. Hidrólogo"),
+                     textInput("institucion_reporte", "Institución:", value = "UNSA")
+              ),
+              column(4,
+                     selectInput("nivel_detalle", "Nivel de Detalle:",
+                                 choices = c("Resumido" = "resumido",
+                                             "Estándar" = "estandar",
+                                             "Completo" = "completo"),
+                                 selected = "estandar"),
+                     checkboxGroupInput("secciones_reporte", "Incluir Secciones:",
+                                        choices = c("Introducción" = "intro",
+                                                    "Metodología" = "metodo",
+                                                    "Resultados" = "resultados",
+                                                    "Conclusiones" = "conclusiones",
+                                                    "Recomendaciones" = "recomendaciones"),
+                                        selected = c("intro", "metodo", "resultados", 
+                                                     "conclusiones", "recomendaciones"))
+              ),
+              column(4,
+                     h5("Generar Reporte:"),
+                     actionButton("generar_reporte_pdf", "Generar Reporte PDF",
+                                  icon = icon("file-pdf"),
+                                  class = "btn-danger",
+                                  style = "width: 100%; margin-bottom: 10px;"),
+                     hr(),
+                     h5("Exportar Datos:"),
+                     downloadButton("descargar_resumen", "Resumen Ejecutivo (.docx)",
+                                    class = "btn-success",
+                                    style = "width: 100%; margin-bottom: 5px;"),
+                     downloadButton("descargar_datos_completos", "Datos Completos (.xlsx)",
+                                    class = "btn-info",
+                                    style = "width: 100%;")
+              )
+            ),
+            
+            hr(),
+            
+            tags$div(
+              class = "alert alert-info",
+              icon("info-circle"),
+              tags$strong("Instrucciones: "),
+              "Configure los parámetros del reporte y haga clic en 'Generar Reporte PDF'."
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+# 4. SERVER DE LA APLICACIÓN
+server <- function(input, output, session) {
+  
+  # ============================================
+  # VARIABLES REACTIVAS
+  # ============================================
+  
+  # Datos originales y procesados
+  datos_originales <- reactiveVal(NULL)
+  datos_procesados <- reactiveVal(NULL)
+  maximos_anuales <- reactiveVal(NULL)
+  datos_calculados <- reactiveVal(FALSE)
+  resultados_residuales <- reactiveVal(NULL)
+  
+  # Resultados de ajuste de distribuciones
+  ajustes_distribuciones <- reactiveVal(list())
+  resultados_bootstrap <- reactiveVal(NULL)
+  pronostiles_calculados <- reactiveVal(NULL)
+  
+  # Estado del sistema
+  estado_proceso <- reactiveVal("esperando")  # esperando, cargando, procesando, listo, error
+  
+  # ============================================
+  # MÓDULO 1: CARGA Y PROCESAMIENTO DE DATOS
+  # ============================================
+  
+  # Observador para procesar datos
+  observeEvent(input$procesar, {
+    req(input$archivo)
+    
+    estado_proceso("cargando")
+    
+    tryCatch({
+      # Leer archivo según formato
+      if (input$formato == "excel") {
+        df <- readxl::read_excel(input$archivo$datapath)
+      } else {
+        df <- read.csv(input$archivo$datapath,
+                       sep = input$separador,
+                       header = input$header,
+                       stringsAsFactors = FALSE)
+      }
+      
+      # Normalizar nombres de columnas
+      nombres_norm <- normalizar_nombres(names(df))
+      names(df) <- nombres_norm
+      
+      # Verificar columnas requeridas para TU archivo
+      requeridas <- normalizar_nombres(c("Año", "Mes", "Dia", "Precipitación acumulada", 
+                                         "Temperatura máxima", "Temperatura mínima"))
+      columnas_faltantes <- requeridas[!requeridas %in% nombres_norm]
+      
+      if (length(columnas_faltantes) > 0) {
+        stop(paste("Faltan columnas:", paste(columnas_faltantes, collapse = ", ")))
+      }
+      
+      # Procesar fechas para TU formato (Año, Mes, Día separados)
+      df <- df %>%
+        mutate(
+          # Asegurar que las columnas sean numéricas
+          año = as.numeric(ano),
+          mes = as.numeric(mes),
+          dia = as.numeric(dia),
+          precipitacion = as.numeric(precipitacion_acumulada),
+          
+          # Crear columna de fecha combinando Año, Mes, Día
+          fecha = make_date(año, mes, dia)
+        ) %>%
+        filter(
+          fecha >= input$rango_fechas[1],
+          fecha <= input$rango_fechas[2],
+          !is.na(fecha),
+          !is.na(precipitacion)
+        )
+      
+      # Calcular máximos anuales
+      maximos <- df %>%
+        group_by(año) %>%
+        summarise(
+          precipitacion_max = max(precipitacion, na.rm = TRUE),
+          n_dias = sum(!is.na(precipitacion)),
+          .groups = 'drop'
+        ) %>%
+        filter(!is.na(precipitacion_max))
+      
+      # Guardar datos
+      datos_originales(df)
+      maximos_anuales(maximos)
+      estado_proceso("listo")
+      
+      showNotification("Datos procesados correctamente", 
+                       type = "message", duration = 3)
+      
+    }, error = function(e) {
+      estado_proceso("error")
+      showNotification(paste("Error:", e$message), 
+                       type = "error", duration = 10)
+    })
+  })
+  
+  # ============================================
+  # MÓDULO 2: ANÁLISIS EXPLORATORIO - SERVER
+  # ============================================
+  
+  # 1. Serie Temporal con tendencia y media móvil CORREGIDA
+  output$serie_temporal <- renderPlot({
+    req(maximos_anuales())
+    
+    df <- maximos_anuales()
+    
+    # Crear gráfico base
+    p <- ggplot(df, aes(x = año, y = precipitacion_max)) +
+      geom_line(color = "steelblue", size = 1) +
+      geom_point(color = "darkred", size = 2) +
+      labs(
+        title = paste("Serie Temporal de Precipitación Máxima Anual -", input$estacion),
+        subtitle = paste("Período:", min(df$año, na.rm = TRUE), "-", max(df$año, na.rm = TRUE)),
+        x = "Año",
+        y = "Precipitación Máxima (mm)"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+      )
+    
+    # Añadir suavizado loess
+    if (!is.null(input$suavizado)) {
+      p <- p + geom_smooth(method = "loess", se = FALSE, 
+                           span = input$suavizado, color = "darkgreen", alpha = 0.5)
+    }
+    
+    # Añadir línea de tendencia lineal SI está marcado
+    if (input$tendencia) {
+      p <- p + geom_smooth(method = "lm", se = FALSE, color = "blue", 
+                           linetype = "dashed", size = 0.8, formula = y ~ x)
+    }
+    
+    # Añadir media móvil SI está marcado
+    if (input$media_movil) {
+      # Calcular media móvil
+      n <- input$anios_media_movil
+      if (!is.na(n) && n > 1) {
+        library(zoo)
+        df$media_movil <- rollmean(df$precipitacion_max, n, fill = NA, align = "right")
+        p <- p + geom_line(data = df, aes(x = año, y = media_movil), 
+                           color = "orange", size = 1, linetype = "twodash")
+      }
+    }
+    
+    p
+  })
+  
+  output$tabla_bondad_ajuste <- renderDT({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    ajustes <- ajustes_distribuciones()
+    datos <- maximos_anuales()$precipitacion_max
+    
+    if (length(ajustes) == 0) return(NULL)
+    
+    tabla_bondad <- list()
+    
+    for (nombre in names(ajustes)) {
+      if (!is.null(ajustes[[nombre]])) {
+        
+        if (nombre %in% c("gev", "gumbel")) {
+          # Para evd::fgev - Cálculo manual de AIC/BIC
+          # VERIFICAR SI EXISTE nllh ANTES DE USARLO
+          if (!is.null(ajustes[[nombre]]$nllh)) {
+            nllh <- ajustes[[nombre]]$nllh  # Negative log-likelihood
+            loglik_val <- -nllh  # Log-likelihood positivo
+            k <- length(ajustes[[nombre]]$estimate)
+            n <- length(datos)
+            
+            aic_val <- 2*k - 2*loglik_val
+            bic_val <- k*log(n) - 2*loglik_val
+            
+            # KS test - CON PROTECCIÓN PARA ERRORES
+            ks_pval <- NA
+            try({
+              if (nombre == "gev") {
+                cdf_fun <- function(x) pgev(x, 
+                                            loc = ajustes$gev$estimate[1],
+                                            scale = ajustes$gev$estimate[2],
+                                            shape = ajustes$gev$estimate[3])
+              } else { # gumbel
+                cdf_fun <- function(x) pgev(x, 
+                                            loc = ajustes$gumbel$estimate[1],
+                                            scale = ajustes$gumbel$estimate[2],
+                                            shape = 0)
+              }
+              ks_test <- ks.test(datos, cdf_fun)
+              ks_pval <- ks_test$p.value
+            }, silent = TRUE)
+            
+            tabla_bondad[[nombre]] <- data.frame(
+              Distribución = nombre,
+              AIC = round(aic_val, 2),
+              BIC = round(bic_val, 2),
+              `Log-Lik` = round(loglik_val, 2),
+              KS = round(ks_pval, 4),
+              AD = NA
+            )
+          } else {
+            # Si no hay nllh, mostrar NA
+            tabla_bondad[[nombre]] <- data.frame(
+              Distribución = nombre,
+              AIC = NA,
+              BIC = NA,
+              `Log-Lik` = NA,
+              KS = NA,
+              AD = NA
+            )
+          }
+          
+        } else if (nombre == "gamma") {
+          # Para Gamma (fitdistrplus)
+          aic_val <- NA
+          bic_val <- NA
+          loglik_val <- NA
+          ks_pval <- NA
+          
+          try({
+            aic_val <- ajustes[[nombre]]$aic
+            bic_val <- ajustes[[nombre]]$bic
+            loglik_val <- ajustes[[nombre]]$loglik
+            
+            cdf_gamma <- function(x) pgamma(x, 
+                                            shape = ajustes[[nombre]]$estimate[1],
+                                            rate = ajustes[[nombre]]$estimate[2])
+            ks_test <- ks.test(datos, cdf_gamma)
+            ks_pval <- ks_test$p.value
+          }, silent = TRUE)
+          
+          tabla_bondad[[nombre]] <- data.frame(
+            Distribución = nombre,
+            AIC = round(aic_val, 2),
+            BIC = round(bic_val, 2),
+            `Log-Lik` = round(loglik_val, 2),
+            KS = round(ks_pval, 4),
+            AD = NA
+          )
+          
+        } else if (nombre %in% c("powerlindley", "zeghdoudi")) {
+          # Para distribuciones personalizadas
+          aic_val <- NA
+          bic_val <- NA
+          loglik_val <- NA
+          ks_pval <- NA
+          
+          try({
+            if (nombre == "powerlindley") {
+              alpha <- ajustes$powerlindley$estimate[1]
+              beta <- ajustes$powerlindley$estimate[2]
+              loglik_val <- sum(log(dpowlindley(datos, alpha, beta)), na.rm = TRUE)
+            } else if (nombre == "zeghdoudi") {
+              alpha <- ajustes$zeghdoudi$estimate[1]
+              lambda <- ajustes$zeghdoudi$estimate[2]
+              loglik_val <- sum(log(dzeghdoudi(datos, alpha, lambda)), na.rm = TRUE)
+            }
+            
+            k <- 2
+            n <- length(datos)
+            aic_val <- 2*k - 2*loglik_val
+            bic_val <- k*log(n) - 2*loglik_val
+            
+            # KS test para distribuciones personalizadas
+            if (nombre == "powerlindley") {
+              cdf_fun <- function(x) ppowlindley(x, alpha, beta)
+            } else if (nombre == "zeghdoudi") {
+              cdf_fun <- function(x) pzeghdoudi(x, alpha, lambda)
+            }
+            
+            ks_test <- ks.test(datos, cdf_fun)
+            ks_pval <- ks_test$p.value
+          }, silent = TRUE)
+          
+          tabla_bondad[[nombre]] <- data.frame(
+            Distribución = nombre,
+            AIC = round(aic_val, 2),
+            BIC = round(bic_val, 2),
+            `Log-Lik` = round(loglik_val, 2),
+            KS = round(ks_pval, 4),
+            AD = NA
+          )
+        }
+      }
+    }
+    
+    # Combinar todas las tablas
+    if (length(tabla_bondad) > 0) {
+      tabla_final <- do.call(rbind, tabla_bondad)
+      rownames(tabla_final) <- NULL
+      
+      # Ordenar por AIC (mejor primero)
+      if (nrow(tabla_final) > 1 && !all(is.na(tabla_final$AIC))) {
+        tabla_final <- tabla_final[order(tabla_final$AIC, na.last = TRUE), ]
+      }
+      
+      datatable(
+        tabla_final,
+        options = list(
+          pageLength = 10,
+          dom = 'Bfrtip',
+          buttons = c('copy', 'csv', 'excel'),
+          language = list(url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Spanish.json')
+        ),
+        rownames = FALSE
+      ) %>%
+        formatStyle(
+          'KS',
+          backgroundColor = styleInterval(c(0.05, 0.1), c('red', 'yellow', 'green'))
+        ) %>%
+        formatStyle(
+          'AD', 
+          backgroundColor = styleInterval(c(0.05, 0.1), c('red', 'yellow', 'green'))
+        )
+    } else {
+      datatable(data.frame(Mensaje = "No hay resultados de bondad de ajuste"))
+    }
+  })
+  
+  output$grafico_colas <- renderPlot({
+    req(maximos_anuales())
+    
+    datos <- maximos_anuales()$precipitacion_max
+    
+    # 1. Función de exceso medio (Mean Excess Function)
+    mean_excess <- function(u, datos) {
+      excesos <- datos[datos > u] - u
+      if (length(excesos) > 0) {
+        return(mean(excesos, na.rm = TRUE))
+      } else {
+        return(NA)
+      }
+    }
+    
+    # 2. Calcular para diferentes umbrales - USAR INPUTS REACTIVOS
+    percentil_actual <- input$percentil_cola
+    exceso_umbral <- input$exceso_cola
+    
+    # Crear secuencia de umbrales basada en el percentil seleccionado
+    umbrales <- quantile(datos, probs = seq(0.7, percentil_actual, by = 0.05), na.rm = TRUE)
+    excesos_medios <- sapply(umbrales, mean_excess, datos = datos)
+    
+    # 3. Crear data frame
+    df_me <- data.frame(
+      Umbral = umbrales,
+      Exceso_Medio = excesos_medios
+    ) %>%
+      filter(!is.na(Exceso_Medio))
+    
+    if (nrow(df_me) < 2) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "Datos insuficientes para análisis de colas")
+      return()
+    }
+    
+    # 4. Gráfico de exceso medio
+    p1 <- ggplot(df_me, aes(x = Umbral, y = Exceso_Medio)) +
+      geom_point(color = "steelblue", size = 3) +
+      geom_line(color = "darkred", size = 1) +
+      geom_vline(xintercept = exceso_umbral, 
+                 color = "green", linetype = "dashed", size = 1) +
+      labs(
+        title = paste("Función de Exceso Medio (Percentil:", percentil_actual, ")"),
+        subtitle = paste("Umbral seleccionado:", exceso_umbral, "mm"),
+        x = "Umbral (mm)",
+        y = "Exceso Medio (mm)"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+      )
+    
+    # 5. Análisis de Exceso sobre Umbral (POT)
+    if (length(datos[datos > exceso_umbral]) > 5) {
+      # Calcular excesos sobre umbral
+      excesos <- datos[datos > exceso_umbral] - exceso_umbral
+      
+      # Gráfico de excesos
+      df_excesos <- data.frame(
+        Exceso = excesos,
+        Orden = 1:length(excesos)
+      )
+      
+      p2 <- ggplot(df_excesos, aes(x = Orden, y = Exceso)) +
+        geom_point(color = "steelblue", size = 2) +
+        geom_line(color = "darkred", size = 0.5, alpha = 0.5) +
+        geom_hline(yintercept = mean(excesos, na.rm = TRUE), 
+                   color = "green", linetype = "dashed", size = 1) +
+        labs(
+          title = paste("Excesos sobre Umbral (", exceso_umbral, "mm)"),
+          subtitle = paste("Número de excesos:", length(excesos)),
+          x = "Orden del Exceso",
+          y = "Exceso (mm)"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+        )
+      
+      # 6. Histograma de excesos
+      p3 <- ggplot(df_excesos, aes(x = Exceso)) +
+        geom_histogram(aes(y = ..density..), 
+                       bins = 15,
+                       fill = "lightblue", 
+                       color = "black",
+                       alpha = 0.7) +
+        geom_density(color = "darkred", size = 1) +
+        labs(
+          title = "Distribución de Excesos",
+          subtitle = paste("Media:", round(mean(excesos, na.rm = TRUE), 2), 
+                           "mm | Desv. Est.:", round(sd(excesos, na.rm = TRUE), 2), "mm"),
+          x = "Exceso (mm)",
+          y = "Densidad"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+        )
+      
+      # 7. Q-Q Plot de excesos
+      excesos_ordenados <- sort(excesos)
+      n_exc <- length(excesos_ordenados)
+      probs_exc <- (1:n_exc - 0.5) / n_exc
+      qq_exp <- qexp(probs_exc, rate = 1/mean(excesos, na.rm = TRUE))
+      
+      df_qq_exc <- data.frame(
+        Empírico = excesos_ordenados,
+        Teórico = qq_exp
+      )
+      
+      p4 <- ggplot(df_qq_exc, aes(x = Teórico, y = Empírico)) +
+        geom_point(color = "steelblue", alpha = 0.6, size = 2) +
+        geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1) +
+        labs(
+          title = "Q-Q Plot de Excesos vs Exponencial",
+          subtitle = "Diagnóstico de excesos exponenciales",
+          x = "Cuantiles Teóricos (Exponencial)",
+          y = "Cuantiles Empíricos"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+        )
+      
+      # 8. Combinar gráficos en una matriz 2x2
+      if (requireNamespace("gridExtra", quietly = TRUE)) {
+        gridExtra::grid.arrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+      } else {
+        # Alternativa simple
+        par(mfrow = c(2, 2))
+        # Gráfico 1
+        plot(df_me$Umbral, df_me$Exceso_Medio, type = "o", 
+             col = "steelblue", pch = 16, lwd = 2,
+             main = paste("Función de Exceso Medio (Percentil:", percentil_actual, ")"),
+             xlab = "Umbral (mm)", ylab = "Exceso Medio (mm)")
+        abline(v = exceso_umbral, col = "green", lty = 2, lwd = 2)
+        
+        # Gráfico 2
+        plot(excesos, type = "o", col = "steelblue", pch = 16, lwd = 1,
+             main = paste("Excesos sobre Umbral (", exceso_umbral, "mm)"),
+             xlab = "Orden del Exceso", ylab = "Exceso (mm)")
+        abline(h = mean(excesos), col = "green", lty = 2, lwd = 2)
+        
+        # Gráfico 3
+        hist(excesos, breaks = 15, col = "lightblue", border = "black",
+             main = "Distribución de Excesos", 
+             xlab = "Exceso (mm)", ylab = "Frecuencia", probability = TRUE)
+        lines(density(excesos), col = "darkred", lwd = 2)
+        
+        # Gráfico 4
+        qqplot(qq_exp, excesos_ordenados, 
+               xlab = "Cuantiles Teóricos (Exponencial)",
+               ylab = "Cuantiles Empíricos",
+               main = "Q-Q Plot de Excesos vs Exponencial",
+               col = "steelblue", pch = 16)
+        abline(0, 1, col = "red", lty = 2, lwd = 2)
+        
+        par(mfrow = c(1, 1))
+      }
+      
+    } else {
+      # Si no hay suficientes excesos, mostrar solo el primer gráfico
+      p1
+    }
+  })
+  
+  # 2. Estadísticas descriptivas
+  output$estadisticas_descriptivas <- renderTable({
+    req(maximos_anuales())
+    
+    df <- maximos_anuales()
+    
+    # Calcular estadísticas básicas
+    stats <- df$precipitacion_max
+    
+    data.frame(
+      Estadística = c("Media", "Mediana", "Desviación Estándar",
+                      "Mínimo", "Máximo", "Coef. Variación (%)",
+                      "Asimetría", "Curtosis", "N° Años"),
+      Valor = c(
+        round(mean(stats, na.rm = TRUE), 2),
+        round(median(stats, na.rm = TRUE), 2),
+        round(sd(stats, na.rm = TRUE), 2),
+        round(min(stats, na.rm = TRUE), 2),
+        round(max(stats, na.rm = TRUE), 2),
+        round(sd(stats, na.rm = TRUE)/mean(stats, na.rm = TRUE)*100, 2),
+        round(moments::skewness(stats, na.rm = TRUE), 3),
+        round(moments::kurtosis(stats, na.rm = TRUE) - 3, 3),
+        length(stats)
+      )
+    )
+  })
+  
+  # 3. Boxplot anual (solo muestra si hay datos mensuales)
+  output$boxplot_anual <- renderPlot({
+    req(datos_procesados())
+    
+    df <- datos_procesados()
+    
+    # Agrupar por año para boxplot
+    df_anual <- df %>%
+      group_by(año) %>%
+      summarise(
+        media = mean(precipitacion, na.rm = TRUE),
+        mediana = median(precipitacion, na.rm = TRUE),
+        maximo = max(precipitacion, na.rm = TRUE),
+        minimo = min(precipitacion, na.rm = TRUE),
+        n_datos = n()
+      )
+    
+    ggplot(df_anual, aes(x = factor(año), y = maximo)) +
+      geom_boxplot(fill = "lightgreen", alpha = 0.7) +
+      stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+      labs(
+        title = "Distribución de Precipitación Máxima por Año",
+        x = "Año",
+        y = "Precipitación Máxima (mm)"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+      )
+  })
+  
+  # 4. Histograma con densidad - CORREGIDO
+  output$histograma <- renderPlot({
+    req(maximos_anuales())
+    
+    df <- maximos_anuales()
+    datos <- df$precipitacion_max
+    
+    # Crear histograma
+    p <- ggplot(df, aes(x = precipitacion_max)) +
+      geom_histogram(
+        aes(y = ..density..),
+        bins = input$bins,
+        fill = "lightblue",
+        color = "black",
+        alpha = 0.7
+      ) +
+      labs(
+        title = "Distribución de Frecuencias de Precipitación Máxima Anual",
+        subtitle = paste("Media =", round(mean(datos, na.rm = TRUE), 2), 
+                         "mm | Desv. Est. =", round(sd(datos, na.rm = TRUE), 2), "mm"),
+        x = "Precipitación Máxima (mm)",
+        y = "Densidad"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+      )
+    
+    # Añadir curva de densidad si está marcado
+    if (input$mostrar_densidad) {
+      p <- p + geom_density(color = "darkred", size = 1, alpha = 0.5)
+    }
+    
+    # Añadir línea de media si está marcado
+    if (input$mostrar_media) {
+      p <- p + geom_vline(aes(xintercept = mean(datos, na.rm = TRUE)),
+                          color = "blue", linetype = "dashed", size = 1)
+    }
+    
+    # Añadir línea de mediana si está marcado
+    if (input$mostrar_mediana) {
+      p <- p + geom_vline(aes(xintercept = median(datos, na.rm = TRUE)),
+                          color = "green", linetype = "dotted", size = 1)
+    }
+    
+    p
+  })
+  
+  # 5. Pruebas de Normalidad - SIMPLIFICADO (sin dependencias de packages)
+  output$pruebas_normalidad <- renderPrint({
+    req(maximos_anuales())
+    
+    datos <- maximos_anuales()$precipitacion_max
+    
+    cat("=== PRUEBAS DE NORMALIDAD ===\n\n")
+    
+    # Prueba de Shapiro-Wilk (si hay menos de 5000 datos)
+    if (length(datos) < 5000) {
+      shapiro_test <- shapiro.test(datos)
+      cat("1. Prueba de Shapiro-Wilk:\n")
+      cat(sprintf("   W = %.4f, p-valor = %.4f\n", 
+                  shapiro_test$statistic, shapiro_test$p.value))
+      
+      # Interpretación
+      cat(sprintf("   Interpretación: %s\n\n",
+                  ifelse(shapiro_test$p.value > 0.05, 
+                         "✓ Los datos siguen una distribución normal (p > 0.05)",
+                         "✗ Los datos NO siguen una distribución normal (p ≤ 0.05)")))
+    } else {
+      cat("1. Prueba de Shapiro-Wilk: No aplicable (n > 5000)\n\n")
+    }
+    
+    # Estadísticos descriptivos
+    cat("=== ESTADÍSTICOS DESCRIPTIVOS ===\n")
+    cat(sprintf("Media: %.2f mm\n", mean(datos, na.rm = TRUE)))
+    cat(sprintf("Mediana: %.2f mm\n", median(datos, na.rm = TRUE)))
+    cat(sprintf("Desviación estándar: %.2f mm\n", sd(datos, na.rm = TRUE)))
+    cat(sprintf("Rango: [%.2f, %.2f] mm\n", min(datos, na.rm = TRUE), max(datos, na.rm = TRUE)))
+    cat(sprintf("Coeficiente de variación: %.1f%%\n\n", sd(datos, na.rm = TRUE)/mean(datos, na.rm = TRUE)*100))
+    
+    # Asimetría y curtosis (si está instalado moments)
+    if (requireNamespace("moments", quietly = TRUE)) {
+      cat(sprintf("Asimetría (skewness): %.3f\n", moments::skewness(datos, na.rm = TRUE)))
+      cat(sprintf("Curtosis (kurtosis): %.3f\n", moments::kurtosis(datos, na.rm = TRUE)))
+      cat("(Curtosis normal = 3)\n")
+    } else {
+      cat("Instala el paquete 'moments' para calcular asimetría y curtosis.\n")
+    }
+  })
+  
+  # 6. Pruebas de Estacionariedad - SIMPLIFICADO
+  output$pruebas_estacionariedad <- renderPrint({
+    req(maximos_anuales())
+    
+    datos <- maximos_anuales()$precipitacion_max
+    tiempo <- maximos_anuales()$año
+    
+    cat("=== ANÁLISIS DE ESTACIONARIEDAD ===\n\n")
+    
+    # 1. Regresión lineal para tendencia
+    if (length(datos) > 2) {
+      modelo <- lm(datos ~ tiempo)
+      coef_modelo <- summary(modelo)$coefficients
+      
+      cat("1. Regresión lineal para tendencia:\n")
+      cat(sprintf("   Ecuación: Y = %.4f + %.4f * X\n", coef_modelo[1,1], coef_modelo[2,1]))
+      cat(sprintf("   Pendiente: %.4f mm/año\n", coef_modelo[2,1]))
+      cat(sprintf("   R² = %.4f\n", summary(modelo)$r.squared))
+      cat(sprintf("   p-valor (pendiente) = %.4f\n", coef_modelo[2,4]))
+      
+      # Interpretación
+      if (coef_modelo[2,4] < 0.05) {
+        cat("   ✓ Tendencia significativa (p < 0.05)\n")
+        if (coef_modelo[2,1] > 0) {
+          cat("   ✓ Tendencia creciente\n")
+        } else {
+          cat("   ✓ Tendencia decreciente\n")
+        }
+      } else {
+        cat("   ✗ Tendencia no significativa (p ≥ 0.05)\n")
+      }
+      cat("\n")
+    }
+    
+    # 2. Comparación de medias entre primera y segunda mitad
+    mitad <- floor(length(datos)/2)
+    if (mitad > 2) {
+      primera_mitad <- datos[1:mitad]
+      segunda_mitad <- datos[(mitad+1):length(datos)]
+      
+      cat("2. Comparación de medias (primera vs segunda mitad):\n")
+      cat(sprintf("   Media primera mitad: %.2f mm\n", mean(primera_mitad, na.rm = TRUE)))
+      cat(sprintf("   Media segunda mitad: %.2f mm\n", mean(segunda_mitad, na.rm = TRUE)))
+      cat(sprintf("   Diferencia: %.2f mm\n", 
+                  mean(segunda_mitad, na.rm = TRUE) - mean(primera_mitad, na.rm = TRUE)))
+      
+      # Test t simple
+      t_test <- try(t.test(primera_mitad, segunda_mitad), silent = TRUE)
+      if (!inherits(t_test, "try-error")) {
+        cat(sprintf("   p-valor (test t) = %.4f\n", t_test$p.value))
+        if (t_test$p.value < 0.05) {
+          cat("   ✗ Diferencia significativa (posible cambio de régimen)\n")
+        } else {
+          cat("   ✓ No hay diferencia significativa\n")
+        }
+      }
+      cat("\n")
+    }
+    
+    # 3. Análisis de variabilidad
+    cat("3. Análisis de variabilidad:\n")
+    cat(sprintf("   Desviación estándar: %.2f mm\n", sd(datos, na.rm = TRUE)))
+    cat(sprintf("   Rango intercuartil (IQR): %.2f mm\n", 
+                IQR(datos, na.rm = TRUE)))
+    cat(sprintf("   Coef. variación: %.1f%%\n", 
+                sd(datos, na.rm = TRUE)/mean(datos, na.rm = TRUE)*100))
+  })
+  
+  # ============================================
+  # MÓDULO DE REPORTES PDF - CÓDIGO CORREGIDO
+  # ============================================
+  
+  # Función para generar reporte PDF
+  observeEvent(input$generar_reporte_pdf, {
+    tryCatch({
+      # Validar que haya datos
+      if (is.null(maximos_anuales())) {
+        showNotification("Cargue datos primero", type = "warning", duration = 5)
+        return()
+      }
+      
+      # Mostrar notificación de proceso
+      id_notif <- showNotification(
+        "Generando reporte PDF... Esto puede tardar unos segundos.",
+        type = "message",
+        duration = NULL
+      )
+      
+      # Obtener datos
+      datos_maximos <- maximos_anuales()
+      ajustes <- ajustes_distribuciones()
+      pronostiles <- pronostiles_calculados()
+      
+      # Crear contenido del reporte
+      fecha_actual <- format(Sys.time(), "%d/%m/%Y %H:%M")
+      estacion <- input$estacion
+      periodo_estudio <- if (!is.null(datos_maximos)) {
+        paste(min(datos_maximos$año), "-", max(datos_maximos$año))
+      } else {
+        "No disponible"
+      }
+      
+      # Estadísticas básicas
+      if (!is.null(datos_maximos)) {
+        precip_data <- datos_maximos$precipitacion_max
+        media_precip <- round(mean(precip_data, na.rm = TRUE), 2)
+        max_precip <- round(max(precip_data, na.rm = TRUE), 2)
+        min_precip <- round(min(precip_data, na.rm = TRUE), 2)
+        n_anios <- nrow(datos_maximos)
+      } else {
+        media_precip <- NA
+        max_precip <- NA
+        min_precip <- NA
+        n_anios <- 0
+      }
+      
+      # Crear contenido HTML para PDF (usando markdown)
+      reporte_content <- paste0(
+        "# Reporte Técnico: ", input$titulo_reporte, "\n\n",
+        "**Autor:** ", input$autor_reporte, "\n",
+        "**Institución:** ", input$institucion_reporte, "\n",
+        "**Fecha de generación:** ", fecha_actual, "\n",
+        "**Estación meteorológica:** ", estacion, "\n",
+        "**Período de estudio:** ", periodo_estudio, "\n\n",
+        
+        "## 1. Resumen Ejecutivo\n\n",
+        "El presente documento resume los resultados del análisis estadístico de eventos extremos de precipitación. ",
+        "El estudio se basó en ", n_anios, " años de datos históricos.\n\n",
+        
+        "## 2. Estadísticas Descriptivas\n\n",
+        "- **Precipitación máxima promedio:** ", media_precip, " mm\n",
+        "- **Precipitación máxima registrada:** ", max_precip, " mm\n",
+        "- **Precipitación mínima registrada:** ", min_precip, " mm\n",
+        "- **Número de años analizados:** ", n_anios, "\n\n",
+        
+        "## 3. Resultados de Ajuste de Distribuciones\n\n"
+      )
+      
+      # Agregar información de distribuciones ajustadas
+      if (!is.null(ajustes) && length(ajustes) > 0) {
+        reporte_content <- paste0(reporte_content,
+                                  "Se ajustaron las siguientes distribuciones de probabilidad:\n\n")
+        
+        for (dist_name in names(ajustes)) {
+          if (!is.null(ajustes[[dist_name]])) {
+            reporte_content <- paste0(reporte_content,
+                                      "- **", toupper(dist_name), ":** Ajustada correctamente\n")
+          }
+        }
+      } else {
+        reporte_content <- paste0(reporte_content,
+                                  "No se han ajustado distribuciones aún.\n")
+      }
+      
+      reporte_content <- paste0(reporte_content, "\n## 4. Pronóstiles de Diseño\n\n")
+      
+      # Agregar pronóstiles si están disponibles
+      if (!is.null(pronostiles) && !is.null(pronostiles$tabla)) {
+        reporte_content <- paste0(reporte_content,
+                                  "Los siguientes pronóstiles se calcularon usando la distribución **",
+                                  toupper(pronostiles$distribucion), "**:\n\n")
+        
+        for (i in 1:nrow(pronostiles$tabla)) {
+          reporte_content <- paste0(reporte_content,
+                                    "- **TR = ", pronostiles$tabla$Periodo_Retorno_años[i], " años:** ",
+                                    pronostiles$tabla$Pronostil_mm[i], " mm\n")
+        }
+      } else {
+        reporte_content <- paste0(reporte_content,
+                                  "No se han calculado pronóstiles de diseño.\n")
+      }
+      
+      reporte_content <- paste0(reporte_content, "\n## 5. Conclusiones\n\n",
+                                "1. El análisis proporciona información valiosa para el diseño hidrológico.\n",
+                                "2. Los valores de precipitación para diferentes períodos de retorno están disponibles.\n",
+                                "3. Se recomienda validar los resultados con estudios locales específicos.\n\n",
+                                
+                                "## 6. Recomendaciones\n\n",
+                                "1. Utilizar los pronóstiles con factores de seguridad apropiados.\n",
+                                "2. Considerar el cambio climático en diseños a largo plazo.\n",
+                                "3. Mantener actualizada la base de datos meteorológica.\n",
+                                "4. Realizar revisiones periódicas del análisis.\n\n",
+                                
+                                "---\n",
+                                "*Documento generado automáticamente por el Sistema de Modelado de Eventos Extremos - UNSA*\n"
+      )
+      
+      # Crear archivo temporal
+      temp_file <- tempfile(fileext = ".md")
+      writeLines(reporte_content, temp_file, useBytes = TRUE)
+      
+      # Convertir a PDF usando markdown si está disponible
+      if (requireNamespace("rmarkdown", quietly = TRUE)) {
+        pdf_file <- tempfile(fileext = ".pdf")
+        
+        # Configuración para PDF
+        pdf_config <- list(
+          "output" = "pdf_document",
+          "includes" = list(
+            "in_header" = NULL
+          ),
+          "number_sections" = TRUE,
+          "toc" = TRUE,
+          "toc_depth" = 3,
+          "fig_caption" = TRUE,
+          "dev" = "cairo_pdf"
+        )
+        
+        # Generar PDF
+        rmarkdown::render(
+          input = temp_file,
+          output_format = "pdf_document",
+          output_file = pdf_file,
+          params = list(
+            estacion = estacion,
+            fecha = fecha_actual,
+            periodo = periodo_estudio
+          ),
+          quiet = TRUE
+        )
+        
+        # Abrir PDF
+        utils::browseURL(pdf_file)
+        
+      } else {
+        # Alternativa: crear HTML bien formateado
+        html_content <- paste0(
+          '<!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="UTF-8">
+          <title>Reporte Técnico</title>
+          <style>
+            body { 
+              font-family: "Times New Roman", Times, serif; 
+              margin: 40px; 
+              line-height: 1.6;
+              color: #333;
+            }
+            h1 { 
+              color: #2c3e50; 
+              border-bottom: 3px solid #2c3e50;
+              padding-bottom: 10px;
+            }
+            h2 { 
+              color: #3498db; 
+              border-bottom: 2px solid #3498db;
+              padding-bottom: 5px;
+              margin-top: 30px;
+            }
+            h3 { color: #7f8c8d; }
+            .header {
+              text-align: center;
+              margin-bottom: 40px;
+              padding: 20px;
+              background-color: #f8f9fa;
+              border-radius: 5px;
+            }
+            table {
+              border-collapse: collapse;
+              width: 100%;
+              margin: 20px 0;
+            }
+            th, td {
+              border: 1px solid #ddd;
+              padding: 10px;
+              text-align: left;
+            }
+            th {
+              background-color: #f2f2f2;
+              font-weight: bold;
+            }
+            .footer {
+              margin-top: 50px;
+              font-size: 12px;
+              color: #7f8c8d;
+              text-align: center;
+              border-top: 1px solid #eee;
+              padding-top: 20px;
+            }
+            .page-break {
+              page-break-before: always;
+            }
+            @media print {
+              body { margin: 0; }
+              .no-print { display: none; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <h1>', input$titulo_reporte, '</h1>
+            <p><strong>Autor:</strong> ', input$autor_reporte, '</p>
+            <p><strong>Institución:</strong> ', input$institucion_reporte, '</p>
+            <p><strong>Fecha:</strong> ', fecha_actual, '</p>
+            <p><strong>Estación:</strong> ', estacion, '</p>
+          </div>
+          
+          <h2>Resumen Ejecutivo</h2>
+          <p>Reporte técnico generado automáticamente con resultados del análisis estadístico de eventos extremos de precipitación.</p>
+          
+          <div class="no-print">
+            <p><em>Para obtener una versión PDF formal, instale el paquete <strong>rmarkdown</strong>.</em></p>
+          </div>
+          
+          ', gsub("\n", "<br>", reporte_content), '
+          
+          <div class="footer">
+            <hr>
+            <p>© ', format(Sys.Date(), "%Y"), ' - Sistema de Modelado de Eventos Extremos</p>
+            <p>Universidad Nacional del Altiplano - Puno, Perú</p>
+          </div>
+        </body>
+        </html>'
+        )
+        
+        html_file <- tempfile(fileext = ".html")
+        writeLines(html_content, html_file, useBytes = TRUE)
+        utils::browseURL(html_file)
+      }
+      
+      # Cerrar notificación
+      removeNotification(id_notif)
+      
+      showNotification(
+        "Reporte generado correctamente",
+        type = "success",
+        duration = 5
+      )
+      
+    }, error = function(e) {
+      # Si hay error, crear un reporte simple
+      showNotification(
+        paste("Generando reporte simple:", e$message),
+        type = "warning",
+        duration = 5
+      )
+      
+      # Reporte de emergencia
+      simple_report <- paste(
+        "REPORTE TÉCNICO",
+        "===================",
+        paste("Estación:", input$estacion),
+        paste("Fecha:", format(Sys.time(), "%d/%m/%Y")),
+        paste("Autor:", input$autor_reporte),
+        "",
+        "RESUMEN",
+        "------",
+        "Reporte generado por el Sistema de Modelado de Eventos Extremos.",
+        "Para ver los datos completos, utilice las funciones de exportación.",
+        "",
+        sep = "\n"
+      )
+      
+      temp_file <- tempfile(fileext = ".txt")
+      writeLines(simple_report, temp_file, useBytes = TRUE)
+      utils::browseURL(temp_file)
+    })
+  })
+  
+  # Función para descargar resumen ejecutivo (Word/Texto)
+  output$descargar_resumen <- downloadHandler(
+    filename = function() {
+      paste("resumen_ejecutivo_", input$estacion, "_", 
+            format(Sys.Date(), "%Y%m%d"), ".txt", sep = "")
+    },
+    content = function(file) {
+      contenido <- paste(
+        "RESUMEN EJECUTIVO",
+        "=================",
+        paste("Análisis de Eventos Extremos de Precipitación"),
+        paste("Estación:", input$estacion),
+        paste("Fecha:", format(Sys.time(), "%d/%m/%Y %H:%M")),
+        "",
+        "RESULTADOS PRINCIPALES:",
+        paste("1. Período analizado:", 
+              if (!is.null(maximos_anuales())) {
+                paste(min(maximos_anuales()$año), "-", max(maximos_anuales()$año))
+              } else {
+                "No disponible"
+              }),
+        paste("2. Número de años:", 
+              if (!is.null(maximos_anuales())) nrow(maximos_anuales()) else "0"),
+        paste("3. Precipitación máxima promedio:",
+              if (!is.null(maximos_anuales())) {
+                round(mean(maximos_anuales()$precipitacion_max, na.rm = TRUE), 2)
+              } else {
+                "No disponible"
+              }, "mm"),
+        "",
+        "INSTRUCCIONES:",
+        "Para obtener los datos completos, utilice las funciones de exportación",
+        "disponibles en cada módulo de la aplicación.",
+        "",
+        "© Sistema de Modelado de Eventos Extremos - UNSA",
+        sep = "\n"
+      )
+      
+      writeLines(contenido, file, useBytes = TRUE)
+    }
+  )
+  
+  # Función para exportar datos completos
+  output$descargar_datos_completos <- downloadHandler(
+    filename = function() {
+      paste("datos_completos_", input$estacion, "_", 
+            format(Sys.Date(), "%Y%m%d"), ".csv", sep = "")
+    },
+    content = function(file) {
+      if (!is.null(datos_originales())) {
+        write.csv(datos_originales(), file, row.names = FALSE, 
+                  fileEncoding = "UTF-8")
+      } else {
+        # Datos de ejemplo si no hay datos reales
+        ejemplo <- data.frame(
+          Mensaje = "No hay datos cargados en el sistema",
+          Instruccion = "Suba datos en la pestaña 'Carga de Datos'",
+          Fecha = format(Sys.Date(), "%d/%m/%Y")
+        )
+        write.csv(ejemplo, file, row.names = FALSE, fileEncoding = "UTF-8")
+      }
+    }
+  )
+  
+  # ============================================
+  # MÓDULO 3: AJUSTE DE DISTRIBUCIONES
+  # ============================================
+  
+  # Observador para ajustar distribuciones - USANDO evd consistentemente
+  observeEvent(input$ajustar_dist, {
+    req(maximos_anuales())
+    
+    # Notificación con ID específico
+    id_notificacion <- showNotification("Ajustando distribuciones...", 
+                                        type = "message", 
+                                        duration = NULL,
+                                        id = "ajuste_dist_notif")
+    
+    tryCatch({
+      datos <- maximos_anuales()$precipitacion_max
+      ajustes <- list()
+      
+      # En el observeEvent(input$ajustar_dist, {}): Asegurar estructura
+      
+      # Ajustar GEV
+      if ("gev" %in% c(input$dist_clasicas, input$dist_colapesada)) {
+        ajustes$gev <- tryCatch({
+          fit <- evd::fgev(datos)
+          cat("DEBUG: GEV ajustado - nllh:", fit$nllh, "estimate:", fit$estimate, "\n")
+          # Devolver el objeto completo
+          fit
+        }, error = function(e) {
+          cat("DEBUG: Error ajustando GEV:", e$message, "\n")
+          showNotification(paste("Error ajustando GEV:", e$message), 
+                           type = "warning", duration = 5)
+          NULL
+        })
+      }
+      
+      # Ajustar Gumbel
+      if ("gumbel" %in% c(input$dist_clasicas, input$dist_colapesada)) {
+        ajustes$gumbel <- tryCatch({
+          fit <- evd::fgev(datos, shape = 0)
+          cat("DEBUG: Gumbel ajustado - nllh:", fit$nllh, "estimate:", fit$estimate, "\n")
+          fit
+        }, error = function(e) {
+          cat("DEBUG: Error ajustando Gumbel:", e$message, "\n")
+          showNotification(paste("Error ajustando Gumbel:", e$message), 
+                           type = "warning", duration = 5)
+          NULL
+        })
+      }
+      
+      # Ajustar Gamma
+      if ("gamma" %in% c(input$dist_clasicas, input$dist_colapesada)) {
+        ajustes$gamma <- tryCatch({
+          fitdist(datos, "gamma", method = "mle")
+        }, error = function(e) {
+          showNotification(paste("Error ajustando Gamma:", e$message), 
+                           type = "warning", duration = 5, id = "error_gamma")
+          NULL
+        })
+      }
+      
+      # Ajustar Power Lindley
+      if ("powerlindley" %in% c(input$dist_clasicas, input$dist_colapesada)) {
+        ajustes$powerlindley <- tryCatch({
+          start_params <- c(alpha = 1.5, beta = 0.5)
+          mle <- optim(start_params, function(par) {
+            -sum(log(dpowlindley(datos, par[1], par[2])))
+          })
+          list(estimate = mle$par, convergence = mle$convergence)
+        }, error = function(e) {
+          showNotification(paste("Error ajustando Power Lindley:", e$message), 
+                           type = "warning", duration = 5, id = "error_powlindley")
+          NULL
+        })
+      }
+      
+      # Ajustar Zeghdoudi
+      if ("zeghdoudi" %in% c(input$dist_clasicas, input$dist_colapesada)) {
+        ajustes$zeghdoudi <- tryCatch({
+          start_params <- c(alpha = 2, lambda = mean(datos))
+          mle <- optim(start_params, function(par) {
+            -sum(log(dzeghdoudi(datos, par[1], par[2])))
+          })
+          list(estimate = mle$par, convergence = mle$convergence)
+        }, error = function(e) {
+          showNotification(paste("Error ajustando Zeghdoudi:", e$message), 
+                           type = "warning", duration = 5, id = "error_zeghdoudi")
+          NULL
+        })
+      }
+      
+      ajustes_distribuciones(ajustes)
+      
+      # Remover la notificación
+      removeNotification(id = "ajuste_dist_notif")
+      
+      showNotification("Distribuciones ajustadas correctamente", 
+                       type = "message", duration = 3, id = "ajuste_exitoso")
+      
+    }, error = function(e) {
+      removeNotification(id = "ajuste_dist_notif")
+      showNotification(paste("Error en ajuste:", e$message), 
+                       type = "error", duration = 10, id = "error_general")
+    })
+  })
+  
+  output$tabla_parametros <- renderDT({
+    req(ajustes_distribuciones())
+    
+    ajustes <- ajustes_distribuciones()
+    if (length(ajustes) == 0) return(NULL)
+    
+    # Crear tabla de parámetros
+    tabla_param <- list()
+    
+    for (nombre in names(ajustes)) {
+      if (!is.null(ajustes[[nombre]])) {
+        
+        if (nombre %in% c("gev", "gumbel")) {
+          # PARA evd::fgev - Estructura diferente
+          params <- ajustes[[nombre]]$estimate
+          
+          # VERIFICAR SI EXISTE 'se' Y ES NUMÉRICO
+          if (!is.null(ajustes[[nombre]]$se) && is.numeric(ajustes[[nombre]]$se)) {
+            se <- ajustes[[nombre]]$se
+          } else {
+            se <- rep(NA, length(params))
+          }
+          
+          # Nombres de parámetros según distribución
+          if (nombre == "gev") {
+            param_names <- c("loc", "scale", "shape")
+          } else { # gumbel
+            param_names <- c("loc", "scale")
+          }
+          
+          # Calcular z-value solo si se tiene error estándar
+          z_values <- numeric(length(params))
+          for (i in 1:length(params)) {
+            if (!is.na(se[i]) && se[i] > 0) {
+              z_values[i] <- params[i] / se[i]
+            } else {
+              z_values[i] <- NA
+            }
+          }
+          
+          tabla_param[[nombre]] <- data.frame(
+            Distribución = nombre,
+            Parámetro = param_names,
+            Estimación = round(params, 4),
+            `Error Estándar` = round(se, 4),
+            `z-value` = round(z_values, 3),
+            stringsAsFactors = FALSE
+          )
+          
+        } else if (nombre == "gamma") {
+          # Para Gamma (fitdist)
+          params <- ajustes[[nombre]]$estimate
+          
+          # VERIFICAR SI EXISTE vcov
+          if (!is.null(ajustes[[nombre]]$vcov) && is.matrix(ajustes[[nombre]]$vcov)) {
+            tryCatch({
+              se <- sqrt(diag(ajustes[[nombre]]$vcov))
+            }, error = function(e) {
+              se <- rep(NA, length(params))
+            })
+          } else {
+            se <- rep(NA, length(params))
+          }
+          
+          # Calcular z-value solo si se tiene error estándar
+          z_values <- numeric(length(params))
+          for (i in 1:length(params)) {
+            if (!is.na(se[i]) && se[i] > 0) {
+              z_values[i] <- params[i] / se[i]
+            } else {
+              z_values[i] <- NA
+            }
+          }
+          
+          tabla_param[[nombre]] <- data.frame(
+            Distribución = nombre,
+            Parámetro = names(params),
+            Estimación = round(params, 4),
+            `Error Estándar` = round(se, 4),
+            `z-value` = round(z_values, 3),
+            stringsAsFactors = FALSE
+          )
+          
+        } else if (nombre %in% c("powerlindley", "zeghdoudi")) {
+          # Para Power Lindley y Zeghdoudi
+          params <- ajustes[[nombre]]$estimate
+          
+          if (nombre == "powerlindley") {
+            param_names <- c("alpha", "beta")
+          } else { # zeghdoudi
+            param_names <- c("alpha", "lambda")
+          }
+          
+          # No tenemos error estándar para estas distribuciones personalizadas
+          se <- rep(NA, length(params))
+          z_values <- rep(NA, length(params))
+          
+          tabla_param[[nombre]] <- data.frame(
+            Distribución = nombre,
+            Parámetro = param_names,
+            Estimación = round(params, 4),
+            `Error Estándar` = NA,
+            `z-value` = NA,
+            stringsAsFactors = FALSE
+          )
+        }
+      }
+    }
+    
+    # Combinar todas las tablas
+    if (length(tabla_param) > 0) {
+      tabla_final <- do.call(rbind, tabla_param)
+      rownames(tabla_final) <- NULL
+      
+      datatable(
+        tabla_final,
+        options = list(
+          pageLength = 10,
+          dom = 'Bfrtip',
+          buttons = c('copy', 'csv', 'excel'),
+          language = list(url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Spanish.json')
+        ),
+        rownames = FALSE
+      )
+    } else {
+      datatable(data.frame(Mensaje = "No hay parámetros estimados"))
+    }
+  })
+  
+  output$grafico_ajuste <- renderPlot({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    datos <- maximos_anuales()$precipitacion_max
+    ajustes <- ajustes_distribuciones()
+    
+    # Crear data frame para ggplot
+    x_range <- seq(0, input$limite_superior, length.out = 1000)
+    df_curvas <- data.frame(x = x_range)
+    
+    # DEFINIR COLORES DENTRO DE LA FUNCIÓN - ESTA ES LA CORRECCIÓN
+    colores <- c("GEV" = "#e74c3c", "Gumbel" = "#3498db", 
+                 "Gamma" = "#2ecc71", "Power Lindley" = "#9b59b6",
+                 "Zeghdoudi" = "#f39c12", "Empírica" = "black")
+    
+    # Gráfico de densidad
+    p <- ggplot(data.frame(x = datos), aes(x = x)) +
+      geom_histogram(aes(y = ..density..), 
+                     bins = input$bins,
+                     fill = "lightblue", 
+                     color = "black",
+                     alpha = 0.5) +
+      labs(title = "Ajuste de Distribuciones de Probabilidad",
+           x = "Precipitación Máxima (mm)",
+           y = "Densidad") +
+      theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+    
+    # Añadir curvas de densidad ajustadas usando evd
+    if (!is.null(ajustes$gev)) {
+      df_curvas$gev <- dgev(df_curvas$x, 
+                            loc = ajustes$gev$estimate[1],
+                            scale = ajustes$gev$estimate[2],
+                            shape = ajustes$gev$estimate[3])
+      p <- p + geom_line(data = df_curvas, aes(x = x, y = gev, color = "GEV"), 
+                         size = 1)
+    }
+    
+    if (!is.null(ajustes$gumbel)) {
+      df_curvas$gumbel <- dgev(df_curvas$x, 
+                               loc = ajustes$gumbel$estimate[1],
+                               scale = ajustes$gumbel$estimate[2],
+                               shape = 0)  # Gumbel es GEV con shape=0
+      p <- p + geom_line(data = df_curvas, aes(x = x, y = gumbel, color = "Gumbel"), 
+                         size = 1)
+    }
+    
+    if (!is.null(ajustes$gamma)) {
+      df_curvas$gamma <- dgamma(df_curvas$x, 
+                                shape = ajustes$gamma$estimate[1],
+                                rate = ajustes$gamma$estimate[2])
+      p <- p + geom_line(data = df_curvas, aes(x = x, y = gamma, color = "Gamma"), 
+                         size = 1)
+    }
+    
+    if (!is.null(ajustes$powerlindley)) {
+      df_curvas$powerlindley <- dpowlindley(df_curvas$x,
+                                            ajustes$powerlindley$estimate[1],
+                                            ajustes$powerlindley$estimate[2])
+      p <- p + geom_line(data = df_curvas, aes(x = x, y = powerlindley, 
+                                               color = "Power Lindley"), 
+                         size = 1)
+    }
+    
+    if (!is.null(ajustes$zeghdoudi)) {
+      df_curvas$zeghdoudi <- dzeghdoudi(df_curvas$x,
+                                        ajustes$zeghdoudi$estimate[1],
+                                        ajustes$zeghdoudi$estimate[2])
+      p <- p + geom_line(data = df_curvas, aes(x = x, y = zeghdoudi, 
+                                               color = "Zeghdoudi"), 
+                         size = 1)
+    }
+    
+    # Añadir densidad empírica
+    if (input$mostrar_empirica) {
+      dens_emp <- density(datos)
+      p <- p + geom_line(data = data.frame(x = dens_emp$x, y = dens_emp$y),
+                         aes(x = x, y = y, color = "Empírica"),
+                         size = 1, linetype = "dashed")
+    }
+    
+    # Añadir leyenda - AHORA 'colores' está definido
+    if (input$mostrar_leyenda) {
+      p <- p + scale_color_manual(name = "Distribuciones", values = colores) +
+        theme(legend.position = "bottom")
+    }
+    
+    p
+  })
+  
+  # ============================================
+  # MÓDULO 4: COMPARACIÓN DE MODELOS - SERVER
+  # ============================================
+  
+  # 1. Gráfico de Criterios de Información
+  output$grafico_criterios <- renderPlot({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    ajustes <- ajustes_distribuciones()
+    datos <- maximos_anuales()$precipitacion_max
+    
+    # Crear dataframe con criterios de información
+    criterios_df <- data.frame()
+    
+    # Función para extraer criterios de cada distribución
+    extraer_criterios <- function(nombre, ajuste) {
+      if (is.null(ajuste)) return(NULL)
+      
+      if (nombre %in% c("GEV", "Gumbel")) {
+        # Para evd::fgev - estructura diferente
+        # VERIFICAR SI EXISTE nllh
+        if (is.null(ajuste$nllh)) return(NULL)
+        
+        nllh <- ajuste$nllh  # Negative log-likelihood
+        loglik <- -nllh  # Log-likelihood positivo
+        k <- length(ajuste$estimate)
+        n <- length(datos)
+        
+        return(data.frame(
+          Distribucion = nombre,
+          AIC = 2*k - 2*loglik,
+          BIC = k*log(n) - 2*loglik,
+          LogLik = loglik,
+          stringsAsFactors = FALSE
+        ))
+        
+      } else if (nombre == "Gamma") {
+        # Para Gamma (fitdist)
+        if (is.null(ajuste$aic) || is.null(ajuste$bic) || is.null(ajuste$loglik)) {
+          return(NULL)
+        }
+        
+        return(data.frame(
+          Distribucion = nombre,
+          AIC = ajuste$aic,
+          BIC = ajuste$bic,
+          LogLik = ajuste$loglik,
+          stringsAsFactors = FALSE
+        ))
+        
+      } else if (nombre %in% c("Power Lindley", "Zeghdoudi")) {
+        # Calcular manualmente para distribuciones personalizadas
+        tryCatch({
+          if (nombre == "Power Lindley") {
+            if (is.null(ajuste$estimate) || length(ajuste$estimate) < 2) return(NULL)
+            alpha <- ajuste$estimate[1]
+            beta <- ajuste$estimate[2]
+            loglik <- sum(log(dpowlindley(datos, alpha, beta)), na.rm = TRUE)
+          } else if (nombre == "Zeghdoudi") {
+            if (is.null(ajuste$estimate) || length(ajuste$estimate) < 2) return(NULL)
+            alpha <- ajuste$estimate[1]
+            lambda <- ajuste$estimate[2]
+            loglik <- sum(log(dzeghdoudi(datos, alpha, lambda)), na.rm = TRUE)
+          }
+          
+          k <- 2
+          n <- length(datos)
+          
+          return(data.frame(
+            Distribucion = nombre,
+            AIC = 2*k - 2*loglik,
+            BIC = k*log(n) - 2*loglik,
+            LogLik = loglik,
+            stringsAsFactors = FALSE
+          ))
+        }, error = function(e) {
+          return(NULL)
+        })
+      }
+      return(NULL)
+    }
+    
+    # Extraer criterios para cada distribución ajustada
+    if (!is.null(ajustes$gev)) {
+      result <- extraer_criterios("GEV", ajustes$gev)
+      if (!is.null(result)) criterios_df <- rbind(criterios_df, result)
+    }
+    
+    if (!is.null(ajustes$gumbel)) {
+      result <- extraer_criterios("Gumbel", ajustes$gumbel)
+      if (!is.null(result)) criterios_df <- rbind(criterios_df, result)
+    }
+    
+    if (!is.null(ajustes$gamma)) {
+      result <- extraer_criterios("Gamma", ajustes$gamma)
+      if (!is.null(result)) criterios_df <- rbind(criterios_df, result)
+    }
+    
+    if (!is.null(ajustes$powerlindley)) {
+      result <- extraer_criterios("Power Lindley", ajustes$powerlindley)
+      if (!is.null(result)) criterios_df <- rbind(criterios_df, result)
+    }
+    
+    if (!is.null(ajustes$zeghdoudi)) {
+      result <- extraer_criterios("Zeghdoudi", ajustes$zeghdoudi)
+      if (!is.null(result)) criterios_df <- rbind(criterios_df, result)
+    }
+    
+    if (nrow(criterios_df) == 0) {
+      # Gráfico vacío con mensaje
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "No hay distribuciones ajustadas o\nno se pudieron calcular criterios",
+           xlim = c(0, 1), ylim = c(0, 1))
+      text(0.5, 0.5, "Ajuste las distribuciones primero", cex = 1.2)
+      return()
+    }
+    
+    # Ordenar por el criterio seleccionado
+    criterio_seleccionado <- ifelse(input$criterio_comparacion == "aic", "AIC", "BIC")
+    
+    if (input$ordenar_criterios && nrow(criterios_df) > 1) {
+      # Ordenar eliminando NAs
+      if (all(is.na(criterios_df[[criterio_seleccionado]]))) {
+        # Si todos son NA, no ordenar
+      } else {
+        criterios_df <- criterios_df[order(criterios_df[[criterio_seleccionado]], 
+                                           na.last = TRUE), ]
+      }
+    }
+    
+    criterios_df$Distribucion <- factor(criterios_df$Distribucion, 
+                                        levels = criterios_df$Distribucion)
+    
+    # Preparar datos para ggplot (formato largo)
+    df_largo <- criterios_df %>%
+      tidyr::pivot_longer(cols = c(AIC, BIC), 
+                          names_to = "Criterio", 
+                          values_to = "Valor") %>%
+      mutate(
+        Etiqueta = if (input$mostrar_valores) {
+          ifelse(is.na(Valor), "", sprintf("%.1f", Valor))
+        } else {
+          ""
+        }
+      )
+    
+    # Crear gráfico de barras
+    p <- ggplot(df_largo, aes(x = Distribucion, y = Valor, fill = Criterio)) +
+      geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.7) +
+      scale_fill_manual(values = c("AIC" = "#3498db", "BIC" = "#e74c3c")) +
+      labs(
+        title = "Comparación de Criterios de Información",
+        subtitle = "Valores más bajos indican mejor ajuste",
+        x = "Distribución",
+        y = "Valor del Criterio"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray50"),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom"
+      )
+    
+    # Añadir etiquetas si se solicitan y hay etiquetas no vacías
+    if (input$mostrar_valores && any(df_largo$Etiqueta != "")) {
+      p <- p + geom_text(aes(label = Etiqueta),
+                         position = position_dodge(width = 0.9),
+                         vjust = -0.5, size = 3)
+    }
+    
+    p
+  })
+  
+  # 2. Tabla de Ranking de Modelos - VERSIÓN CORREGIDA COMPLETA
+  output$tabla_ranking <- renderDT({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    ajustes <- ajustes_distribuciones()
+    datos <- maximos_anuales()$precipitacion_max
+    
+    if (length(ajustes) == 0) {
+      return(datatable(
+        data.frame(Mensaje = "No hay modelos ajustados para comparar"),
+        options = list(pageLength = 5, dom = 't')
+      ))
+    }
+    
+    # Crear dataframe de ranking
+    ranking_list <- list()
+    
+    # 1. GEV - CORRECCIÓN: Usar estructura correcta de evd::fgev
+    if (!is.null(ajustes$gev)) {
+      tryCatch({
+        # Para evd::fgev, la log-verosimilitud está en nllh (negativa)
+        nllh <- ajustes$gev$nllh  # Negative log-likelihood
+        loglik <- -nllh  # Convertir a log-likelihood positivo
+        
+        # Número de parámetros: loc, scale, shape
+        k <- length(ajustes$gev$estimate)
+        n <- length(datos)
+        
+        # Calcular AIC y BIC
+        aic_val <- 2*k - 2*loglik
+        bic_val <- k*log(n) - 2*loglik
+        
+        ranking_list[["GEV"]] <- data.frame(
+          Distribucion = "GEV",
+          N_Parametros = k,
+          AIC = aic_val,
+          BIC = bic_val,
+          LogLik = loglik,
+          stringsAsFactors = FALSE
+        )
+      }, error = function(e) {
+        ranking_list[["GEV"]] <- data.frame(
+          Distribucion = "GEV",
+          N_Parametros = 3,
+          AIC = NA,
+          BIC = NA,
+          LogLik = NA,
+          stringsAsFactors = FALSE
+        )
+      })
+    }
+    
+    # 2. Gumbel (GEV con shape=0) - CORRECCIÓN
+    if (!is.null(ajustes$gumbel)) {
+      tryCatch({
+        nllh <- ajustes$gumbel$nllh
+        loglik <- -nllh
+        k <- length(ajustes$gumbel$estimate)  # 2 parámetros: loc, scale
+        n <- length(datos)
+        
+        aic_val <- 2*k - 2*loglik
+        bic_val <- k*log(n) - 2*loglik
+        
+        ranking_list[["Gumbel"]] <- data.frame(
+          Distribucion = "Gumbel",
+          N_Parametros = k,
+          AIC = aic_val,
+          BIC = bic_val,
+          LogLik = loglik,
+          stringsAsFactors = FALSE
+        )
+      }, error = function(e) {
+        ranking_list[["Gumbel"]] <- data.frame(
+          Distribucion = "Gumbel",
+          N_Parametros = 2,
+          AIC = NA,
+          BIC = NA,
+          LogLik = NA,
+          stringsAsFactors = FALSE
+        )
+      })
+    }
+    
+    # 3. Gamma
+    if (!is.null(ajustes$gamma)) {
+      tryCatch({
+        ranking_list[["Gamma"]] <- data.frame(
+          Distribucion = "Gamma",
+          N_Parametros = 2,
+          AIC = ajustes$gamma$aic,
+          BIC = ajustes$gamma$bic,
+          LogLik = ajustes$gamma$loglik,
+          stringsAsFactors = FALSE
+        )
+      }, error = function(e) {
+        ranking_list[["Gamma"]] <- data.frame(
+          Distribucion = "Gamma",
+          N_Parametros = 2,
+          AIC = NA,
+          BIC = NA,
+          LogLik = NA,
+          stringsAsFactors = FALSE
+        )
+      })
+    }
+    
+    # 4. Power Lindley
+    if (!is.null(ajustes$powerlindley)) {
+      tryCatch({
+        alpha <- ajustes$powerlindley$estimate[1]
+        beta <- ajustes$powerlindley$estimate[2]
+        
+        # Calcular log-likelihood manualmente
+        loglik <- sum(log(dpowlindley(datos, alpha, beta)), na.rm = TRUE)
+        k <- 2
+        n <- length(datos)
+        
+        ranking_list[["Power Lindley"]] <- data.frame(
+          Distribucion = "Power Lindley",
+          N_Parametros = k,
+          AIC = 2*k - 2*loglik,
+          BIC = k*log(n) - 2*loglik,
+          LogLik = loglik,
+          stringsAsFactors = FALSE
+        )
+      }, error = function(e) {
+        ranking_list[["Power Lindley"]] <- data.frame(
+          Distribucion = "Power Lindley",
+          N_Parametros = 2,
+          AIC = NA,
+          BIC = NA,
+          LogLik = NA,
+          stringsAsFactors = FALSE
+        )
+      })
+    }
+    
+    # 5. Zeghdoudi
+    if (!is.null(ajustes$zeghdoudi)) {
+      tryCatch({
+        alpha <- ajustes$zeghdoudi$estimate[1]
+        lambda <- ajustes$zeghdoudi$estimate[2]
+        
+        # Calcular log-likelihood manualmente
+        loglik <- sum(log(dzeghdoudi(datos, alpha, lambda)), na.rm = TRUE)
+        k <- 2
+        n <- length(datos)
+        
+        ranking_list[["Zeghdoudi"]] <- data.frame(
+          Distribucion = "Zeghdoudi",
+          N_Parametros = k,
+          AIC = 2*k - 2*loglik,
+          BIC = k*log(n) - 2*loglik,
+          LogLik = loglik,
+          stringsAsFactors = FALSE
+        )
+      }, error = function(e) {
+        ranking_list[["Zeghdoudi"]] <- data.frame(
+          Distribucion = "Zeghdoudi",
+          N_Parametros = 2,
+          AIC = NA,
+          BIC = NA,
+          LogLik = NA,
+          stringsAsFactors = FALSE
+        )
+      })
+    }
+    
+    # Combinar todos los resultados
+    ranking_df <- do.call(rbind, ranking_list)
+    rownames(ranking_df) <- NULL
+    
+    if (nrow(ranking_df) == 0) {
+      return(datatable(
+        data.frame(Mensaje = "No se pudieron calcular métricas para los modelos"),
+        options = list(pageLength = 5, dom = 't')
+      ))
+    }
+    
+    # Calcular diferencias (Δ) solo si hay valores válidos
+    if (!all(is.na(ranking_df$AIC))) {
+      ranking_df$ΔAIC <- ranking_df$AIC - min(ranking_df$AIC, na.rm = TRUE)
+      ranking_df$ΔBIC <- ranking_df$BIC - min(ranking_df$BIC, na.rm = TRUE)
+      
+      # Calcular pesos de Akaike
+      delta_aic <- ranking_df$ΔAIC
+      # Evitar problemas con valores infinitos o muy grandes
+      delta_aic_finite <- ifelse(is.finite(delta_aic), delta_aic, max(delta_aic[is.finite(delta_aic)], na.rm = TRUE) + 10)
+      likelihoods <- exp(-0.5 * delta_aic_finite)
+      total_likelihood <- sum(likelihoods, na.rm = TRUE)
+      
+      if (total_likelihood > 0) {
+        ranking_df$PesoAIC <- round(likelihoods / total_likelihood, 3)
+      } else {
+        ranking_df$PesoAIC <- NA
+      }
+    } else {
+      ranking_df$ΔAIC <- NA
+      ranking_df$ΔBIC <- NA
+      ranking_df$PesoAIC <- NA
+    }
+    
+    # Ordenar por AIC (mejor primero), colocando NA al final
+    if (!all(is.na(ranking_df$AIC))) {
+      ranking_df <- ranking_df[order(ranking_df$AIC, na.last = TRUE), ]
+    }
+    ranking_df$Ranking <- 1:nrow(ranking_df)
+    
+    # Formatear números - solo si no son NA
+    format_if_not_na <- function(x) {
+      ifelse(is.na(x), NA, round(x, 2))
+    }
+    
+    ranking_df$AIC <- format_if_not_na(ranking_df$AIC)
+    ranking_df$BIC <- format_if_not_na(ranking_df$BIC)
+    ranking_df$LogLik <- format_if_not_na(ranking_df$LogLik)
+    ranking_df$ΔAIC <- format_if_not_na(ranking_df$ΔAIC)
+    ranking_df$ΔBIC <- format_if_not_na(ranking_df$ΔBIC)
+    
+    # Seleccionar y renombrar columnas para mostrar
+    display_df <- ranking_df[, c("Ranking", "Distribucion", "N_Parametros", 
+                                 "AIC", "BIC", "ΔAIC", "ΔBIC", "PesoAIC", "LogLik")]
+    
+    # Renombrar columnas para mejor presentación
+    names(display_df) <- c("Ranking", "Distribución", "N° Paráms", 
+                           "AIC", "BIC", "ΔAIC", "ΔBIC", "Peso AIC", "Log-Lik")
+    
+    # Crear tabla interactiva
+    dt <- datatable(
+      display_df,
+      extensions = c('Buttons', 'Scroller'),
+      options = list(
+        pageLength = 10,
+        dom = 'Bfrtip',
+        buttons = c('copy', 'csv', 'excel'),
+        scrollX = TRUE,
+        scrollY = "300px",
+        language = list(
+          url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Spanish.json'
+        )
+      ),
+      rownames = FALSE,
+      caption = "Ranking de modelos: valores más bajos de AIC/BIC indican mejor ajuste"
+    )
+    
+    # Aplicar estilos solo si hay filas y valores no NA
+    if (nrow(display_df) > 0 && !all(is.na(display_df$AIC))) {
+      # Estilo para Ranking
+      dt <- dt %>% formatStyle(
+        'Ranking',
+        backgroundColor = styleEqual(
+          1:nrow(display_df),
+          colorRampPalette(c("#27ae60", "#e74c3c"))(nrow(display_df))
+        ),
+        color = 'white',
+        fontWeight = 'bold'
+      )
+      
+      # Estilo para AIC (barra de color) - solo si hay valores
+      valid_aic <- display_df$AIC[!is.na(display_df$AIC)]
+      if (length(valid_aic) > 1) {
+        aic_range <- range(as.numeric(valid_aic), na.rm = TRUE)
+        dt <- dt %>% formatStyle(
+          'AIC',
+          background = styleColorBar(aic_range, 'lightblue'),
+          backgroundSize = '100% 90%',
+          backgroundRepeat = 'no-repeat',
+          backgroundPosition = 'center'
+        )
+      }
+      
+      # Estilo para Peso AIC si existe
+      if ('Peso AIC' %in% names(display_df)) {
+        dt <- dt %>% formatStyle(
+          'Peso AIC',
+          backgroundColor = styleInterval(
+            c(0.1, 0.3, 0.5, 0.7),
+            c('#e74c3c', '#f39c12', '#f1c40f', '#2ecc71', '#27ae60')
+          ),
+          color = styleInterval(
+            0.5,
+            c('white', 'black')
+          )
+        )
+      }
+    }
+    
+    return(dt)
+  })
+  
+  # 3. Mejor modelo según AIC
+  output$mejor_modelo_aic <- renderText({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    ajustes <- ajustes_distribuciones()
+    datos <- maximos_anuales()$precipitacion_max
+    
+    # Calcular AIC para cada modelo
+    aics <- c()
+    nombres <- c()
+    
+    # GEV
+    if (!is.null(ajustes$gev)) {
+      tryCatch({
+        nllh <- ajustes$gev$nllh
+        loglik <- -nllh
+        k <- length(ajustes$gev$estimate)
+        aics <- c(aics, 2*k - 2*loglik)
+        nombres <- c(nombres, "GEV")
+      }, error = function(e) NULL)
+    }
+    
+    # Gumbel
+    if (!is.null(ajustes$gumbel)) {
+      tryCatch({
+        nllh <- ajustes$gumbel$nllh
+        loglik <- -nllh
+        k <- length(ajustes$gumbel$estimate)
+        aics <- c(aics, 2*k - 2*loglik)
+        nombres <- c(nombres, "Gumbel")
+      }, error = function(e) NULL)
+    }
+    
+    # Gamma
+    if (!is.null(ajustes$gamma) && !is.null(ajustes$gamma$aic)) {
+      aics <- c(aics, ajustes$gamma$aic)
+      nombres <- c(nombres, "Gamma")
+    }
+    
+    # Power Lindley
+    if (!is.null(ajustes$powerlindley)) {
+      tryCatch({
+        alpha <- ajustes$powerlindley$estimate[1]
+        beta <- ajustes$powerlindley$estimate[2]
+        loglik <- sum(log(dpowlindley(datos, alpha, beta)), na.rm = TRUE)
+        aics <- c(aics, 2*2 - 2*loglik)
+        nombres <- c(nombres, "Power Lindley")
+      }, error = function(e) NULL)
+    }
+    
+    # Zeghdoudi
+    if (!is.null(ajustes$zeghdoudi)) {
+      tryCatch({
+        alpha <- ajustes$zeghdoudi$estimate[1]
+        lambda <- ajustes$zeghdoudi$estimate[2]
+        loglik <- sum(log(dzeghdoudi(datos, alpha, lambda)), na.rm = TRUE)
+        aics <- c(aics, 2*2 - 2*loglik)
+        nombres <- c(nombres, "Zeghdoudi")
+      }, error = function(e) NULL)
+    }
+    
+    if (length(aics) == 0) {
+      return("No hay modelos ajustados")
+    }
+    
+    # Asignar nombres a los AIC
+    names(aics) <- nombres
+    
+    # Encontrar el mínimo (ignorando NAs)
+    if (all(is.na(aics))) {
+      return("No se pudo calcular AIC para ningún modelo")
+    }
+    
+    mejor <- names(which.min(aics))
+    valor <- min(aics, na.rm = TRUE)
+    
+    paste(mejor, "(AIC =", round(valor, 2), ")")
+  })
+  
+  # 4. Mejor modelo según BIC - VERSIÓN CORREGIDA
+  output$mejor_modelo_bic <- renderText({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    ajustes <- ajustes_distribuciones()
+    datos <- maximos_anuales()$precipitacion_max
+    n <- length(datos)
+    
+    if (n == 0) return("No hay datos disponibles")
+    
+    # Calcular BIC para cada modelo
+    bics <- c()
+    nombres <- c()
+    
+    # 1. GEV
+    if (!is.null(ajustes$gev)) {
+      tryCatch({
+        if (!is.null(ajustes$gev$nllh) && is.finite(ajustes$gev$nllh)) {
+          nllh <- ajustes$gev$nllh  # Negative log-likelihood
+          loglik <- -nllh  # Log-likelihood positivo
+          k <- length(ajustes$gev$estimate)
+          bic_val <- k * log(n) - 2 * loglik
+          
+          # Verificar que sea finito
+          if (is.finite(bic_val)) {
+            bics <- c(bics, bic_val)
+            nombres <- c(nombres, "GEV")
+          }
+        }
+      }, error = function(e) {
+        # No añadir si hay error
+      })
+    }
+    
+    # 2. Gumbel
+    if (!is.null(ajustes$gumbel)) {
+      tryCatch({
+        if (!is.null(ajustes$gumbel$nllh) && is.finite(ajustes$gumbel$nllh)) {
+          nllh <- ajustes$gumbel$nllh
+          loglik <- -nllh
+          k <- length(ajustes$gumbel$estimate)
+          bic_val <- k * log(n) - 2 * loglik
+          
+          if (is.finite(bic_val)) {
+            bics <- c(bics, bic_val)
+            nombres <- c(nombres, "Gumbel")
+          }
+        }
+      }, error = function(e) {
+        # No añadir si hay error
+      })
+    }
+    
+    # 3. Gamma
+    if (!is.null(ajustes$gamma) && !is.null(ajustes$gamma$bic)) {
+      if (is.finite(ajustes$gamma$bic)) {
+        bics <- c(bics, ajustes$gamma$bic)
+        nombres <- c(nombres, "Gamma")
+      }
+    }
+    
+    # 4. Power Lindley
+    if (!is.null(ajustes$powerlindley)) {
+      tryCatch({
+        alpha <- ajustes$powerlindley$estimate[1]
+        beta <- ajustes$powerlindley$estimate[2]
+        
+        loglik <- sum(log(dpowlindley(datos, alpha, beta)), na.rm = TRUE)
+        if (is.finite(loglik)) {
+          bic_val <- 2 * log(n) - 2 * loglik
+          
+          if (is.finite(bic_val)) {
+            bics <- c(bics, bic_val)
+            nombres <- c(nombres, "Power Lindley")
+          }
+        }
+      }, error = function(e) {
+        # No añadir si hay error
+      })
+    }
+    
+    # 5. Zeghdoudi
+    if (!is.null(ajustes$zeghdoudi)) {
+      tryCatch({
+        alpha <- ajustes$zeghdoudi$estimate[1]
+        lambda <- ajustes$zeghdoudi$estimate[2]
+        
+        loglik <- sum(log(dzeghdoudi(datos, alpha, lambda)), na.rm = TRUE)
+        if (is.finite(loglik)) {
+          bic_val <- 2 * log(n) - 2 * loglik
+          
+          if (is.finite(bic_val)) {
+            bics <- c(bics, bic_val)
+            nombres <- c(nombres, "Zeghdoudi")
+          }
+        }
+      }, error = function(e) {
+        # No añadir si hay error
+      })
+    }
+    
+    # Verificar que tenemos valores válidos
+    if (length(bics) == 0) {
+      return("No se pudo calcular BIC para ningún modelo")
+    }
+    
+    # Asignar nombres y encontrar mínimo
+    names(bics) <- nombres
+    
+    # Verificar que todos los valores sean finitos
+    if (any(!is.finite(bics))) {
+      # Remover valores no finitos
+      bics <- bics[is.finite(bics)]
+      if (length(bics) == 0) {
+        return("Todos los valores de BIC son no finitos")
+      }
+    }
+    
+    mejor <- names(which.min(bics))
+    valor <- min(bics, na.rm = TRUE)
+    
+    paste(mejor, "(BIC =", round(valor, 2), ")")
+  })
+  
+  
+  
+  # 4. Gráfico de Comparación de Cuantiles
+  output$grafico_cuantiles <- renderPlot({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    ajustes <- ajustes_distribuciones()
+    datos <- maximos_anuales()$precipitacion_max
+    
+    if (length(ajustes) == 0) {
+      # Gráfico vacío
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "Ajuste distribuciones primero")
+      return()
+    }
+    
+    # Generar secuencia de probabilidades
+    prob_min <- input$rango_cuantiles[1]
+    prob_max <- input$rango_cuantiles[2]
+    paso <- input$paso_cuantiles
+    probs <- seq(prob_min, prob_max, by = paso)
+    
+    # Crear dataframe para almacenar cuantiles
+    cuantiles_df <- data.frame()
+    
+    # Función para calcular cuantiles de una distribución
+    calcular_cuantiles <- function(nombre, ajuste, probs) {
+      cuantiles <- numeric(length(probs))
+      
+      tryCatch({
+        if (nombre == "GEV") {
+          cuantiles <- qevd(probs,
+                            loc = ajuste$results$par[1],
+                            scale = ajuste$results$par[2],
+                            shape = ajuste$results$par[3],
+                            type = "GEV")
+        } else if (nombre == "Gumbel") {
+          cuantiles <- qevd(probs,
+                            loc = ajuste$results$par[1],
+                            scale = ajuste$results$par[2],
+                            type = "Gumbel")
+        } else if (nombre == "Gamma") {
+          cuantiles <- qgamma(probs,
+                              shape = ajuste$estimate[1],
+                              rate = ajuste$estimate[2])
+        } else if (nombre == "Power Lindley") {
+          # Función cuantil numérica para Power Lindley
+          for (i in seq_along(probs)) {
+            f <- function(x) ppowlindley(x, ajuste$estimate[1], ajuste$estimate[2]) - probs[i]
+            cuantiles[i] <- uniroot(f, c(0, 1000))$root
+          }
+        } else if (nombre == "Zeghdoudi") {
+          # Función cuantil para Zeghdoudi (inversa analítica)
+          cuantiles <- ajuste$estimate[2] / (-log(probs))^(1/ajuste$estimate[1])
+        }
+      }, error = function(e) {
+        cuantiles <- rep(NA, length(probs))
+      })
+      
+      return(data.frame(
+        Probabilidad = probs,
+        Cuantil = cuantiles,
+        Distribucion = nombre,
+        stringsAsFactors = FALSE
+      ))
+    }
+    
+    # Calcular cuantiles para cada distribución
+    if (!is.null(ajustes$gev)) {
+      cuantiles_df <- rbind(cuantiles_df, calcular_cuantiles("GEV", ajustes$gev, probs))
+    }
+    if (!is.null(ajustes$gumbel)) {
+      cuantiles_df <- rbind(cuantiles_df, calcular_cuantiles("Gumbel", ajustes$gumbel, probs))
+    }
+    if (!is.null(ajustes$gamma)) {
+      cuantiles_df <- rbind(cuantiles_df, calcular_cuantiles("Gamma", ajustes$gamma, probs))
+    }
+    if (!is.null(ajustes$powerlindley)) {
+      cuantiles_df <- rbind(cuantiles_df, calcular_cuantiles("Power Lindley", ajustes$powerlindley, probs))
+    }
+    if (!is.null(ajustes$zeghdoudi)) {
+      cuantiles_df <- rbind(cuantiles_df, calcular_cuantiles("Zeghdoudi", ajustes$zeghdoudi, probs))
+    }
+    
+    # Añadir cuantiles empíricos si se solicita
+    if (input$mostrar_empiricos) {
+      empiricos <- quantile(datos, probs = probs, na.rm = TRUE)
+      cuantiles_df <- rbind(cuantiles_df,
+                            data.frame(
+                              Probabilidad = probs,
+                              Cuantil = empiricos,
+                              Distribucion = "Empírico",
+                              stringsAsFactors = FALSE
+                            ))
+    }
+    
+    # Crear gráfico
+    p <- ggplot(cuantiles_df, aes(x = Probabilidad, y = Cuantil, 
+                                  color = Distribucion, group = Distribucion)) +
+      geom_line(size = 1.2) +
+      geom_point(size = 2, alpha = 0.7) +
+      labs(
+        title = "Comparación de Cuantiles Teóricos",
+        subtitle = paste("Rango de probabilidades:", prob_min, "-", prob_max),
+        x = "Probabilidad",
+        y = "Cuantil (mm)",
+        color = "Distribución"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray50"),
+        legend.position = "bottom"
+      ) +
+      scale_color_brewer(palette = "Set1")
+    
+    # Escala logarítmica si se solicita
+    if (input$log_scale) {
+      p <- p + scale_y_log10()
+    }
+    
+    p
+  })
+  
+  output$grafico_riesgo_residual <- renderPlot({
+    # Requerir que se hayan calculado los residuales
+    req(resultados_residuales())
+    req(datos_calculados())
+    
+    resultados <- resultados_residuales()
+    residuales <- resultados$residuales
+    
+    if (length(residuales) < 2) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "Residuales insuficientes")
+      return()
+    }
+    
+    # Crear gráficos según las opciones seleccionadas
+    plots <- list()
+    
+    # 1. QQ-Plot de residuales (si está marcado)
+    if (input$qqplot_residual) {
+      n <- length(residuales)
+      qq_teorico <- qnorm(ppoints(n))
+      
+      df_qq <- data.frame(
+        Teorico = sort(qq_teorico),
+        Empirico = sort(residuales)
+      )
+      
+      # Calcular bandas de confianza si está seleccionado
+      if (!is.null(input$bandas_residual) && input$bandas_residual > 0) {
+        conf_level <- input$bandas_residual / 100
+        z <- qnorm((1 + conf_level) / 2)
+        se <- (1 / dnorm(qq_teorico)) * sqrt(ppoints(n) * (1 - ppoints(n)) / n)
+        
+        df_qq$Limite_Superior <- qq_teorico + z * se
+        df_qq$Limite_Inferior <- qq_teorico - z * se
+      }
+      
+      p_qq <- ggplot(df_qq, aes(x = Teorico, y = Empirico)) +
+        geom_point(color = "steelblue", alpha = 0.7, size = 2)
+      
+      # Añadir bandas de confianza si existen
+      if (exists("df_qq$Limite_Superior")) {
+        p_qq <- p_qq +
+          geom_ribbon(aes(ymin = Limite_Inferior, ymax = Limite_Superior),
+                      alpha = 0.2, fill = "gray70")
+      }
+      
+      p_qq <- p_qq +
+        geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 1) +
+        labs(
+          title = "QQ-Plot de Residuales",
+          subtitle = paste("Tipo:", resultados$tipo, 
+                           "| Dist:", toupper(resultados$distribucion),
+                           "| n =", resultados$n),
+          x = "Cuantiles Teóricos (Normal)",
+          y = "Cuantiles Empíricos"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+        )
+      
+      plots[[length(plots) + 1]] <- p_qq
+    }
+    
+    # 2. Histograma de residuales (si está marcado)
+    if (input$hist_residual) {
+      df_hist <- data.frame(Residuales = residuales)
+      
+      p_hist <- ggplot(df_hist, aes(x = Residuales)) +
+        geom_histogram(aes(y = ..density..), 
+                       bins = min(20, length(residuales)), 
+                       fill = "lightblue", 
+                       color = "black",
+                       alpha = 0.7) +
+        geom_density(color = "darkred", size = 1) +
+        stat_function(fun = dnorm, 
+                      args = list(mean = mean(residuales, na.rm = TRUE), 
+                                  sd = sd(residuales, na.rm = TRUE)),
+                      color = "green", linetype = "dashed", size = 1) +
+        labs(
+          title = "Distribución de Residuales",
+          subtitle = paste("Media:", round(mean(residuales, na.rm = TRUE), 3),
+                           "| SD:", round(sd(residuales, na.rm = TRUE), 3),
+                           "| Asimetría:", round(moments::skewness(residuales), 3)),
+          x = "Residuales",
+          y = "Densidad"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+        )
+      
+      plots[[length(plots) + 1]] <- p_hist
+    }
+    
+    # 3. Gráfico de dispersión de residuales (si no hay otros gráficos)
+    if (length(plots) == 0) {
+      df_disp <- data.frame(
+        Indice = 1:length(residuales),
+        Residual = residuales
+      )
+      
+      plots[[1]] <- ggplot(df_disp, aes(x = Indice, y = Residual)) +
+        geom_point(color = "steelblue", alpha = 0.7, size = 2) +
+        geom_hline(yintercept = 0, color = "red", linetype = "dashed", size = 1) +
+        geom_smooth(method = "loess", se = FALSE, color = "darkgreen", size = 1) +
+        labs(
+          title = "Gráfico de Dispersión de Residuales",
+          subtitle = paste("Tipo:", resultados$tipo, 
+                           "| Dist:", toupper(resultados$distribucion),
+                           "| Fecha:", format(resultados$fecha_calculo, "%H:%M:%S")),
+          x = "Índice de Observación",
+          y = "Residual"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, color = "gray50")
+        )
+    }
+    
+    # Mostrar los gráficos
+    if (length(plots) == 1) {
+      print(plots[[1]])
+    } else if (length(plots) == 2) {
+      if (requireNamespace("gridExtra", quietly = TRUE)) {
+        gridExtra::grid.arrange(plots[[1]], plots[[2]], ncol = 2)
+      } else {
+        # Alternativa sin gridExtra
+        par(mfrow = c(1, 2))
+        # QQ-Plot básico
+        qqnorm(residuales, main = paste("QQ-Plot |", resultados$tipo))
+        qqline(residuales, col = "red")
+        # Histograma básico
+        hist(residuales, main = paste("Histograma |", resultados$tipo), 
+             xlab = "Residuales", col = "lightblue", probability = TRUE)
+        lines(density(residuales), col = "darkred", lwd = 2)
+        curve(dnorm(x, mean = mean(residuales), sd = sd(residuales)), 
+              add = TRUE, col = "green", lty = 2, lwd = 2)
+        par(mfrow = c(1, 1))
+      }
+    }
+  })
+  output$estadisticas_residuales <- renderPrint({
+    req(resultados_residuales())
+    
+    res <- resultados_residuales()
+    
+    cat("=== ESTADÍSTICAS DE RESIDUALES ===\n\n")
+    cat(sprintf("Tipo de residual: %s\n", res$tipo))
+    cat(sprintf("Distribución de referencia: %s\n", toupper(res$distribucion)))
+    cat(sprintf("Número de residuales válidos: %d\n", res$n))
+    cat(sprintf("Fecha de cálculo: %s\n\n", format(res$fecha_calculo, "%Y-%m-%d %H:%M:%S")))
+    
+    cat("=== ESTADÍSTICOS DESCRIPTIVOS ===\n")
+    cat(sprintf("Media: %.4f\n", res$media))
+    cat(sprintf("Desviación estándar: %.4f\n", res$sd))
+    cat(sprintf("Mínimo: %.4f\n", min(res$residuales, na.rm = TRUE)))
+    cat(sprintf("Máximo: %.4f\n", max(res$residuales, na.rm = TRUE)))
+    cat(sprintf("Rango: %.4f\n", max(res$residuales, na.rm = TRUE) - min(res$residuales, na.rm = TRUE)))
+    
+    if (requireNamespace("moments", quietly = TRUE)) {
+      cat(sprintf("Asimetría: %.4f\n", moments::skewness(res$residuales, na.rm = TRUE)))
+      cat(sprintf("Curtosis: %.4f\n", moments::kurtosis(res$residuales, na.rm = TRUE)))
+    }
+    
+    cat("\n=== PRUEBAS DE NORMALIDAD ===\n")
+    if (length(res$residuales) >= 3 && length(res$residuales) < 5000) {
+      shapiro_test <- shapiro.test(res$residuales)
+      cat(sprintf("Shapiro-Wilk: W = %.4f, p = %.4f\n", 
+                  shapiro_test$statistic, shapiro_test$p.value))
+    }
+    
+    ks_test <- ks.test(res$residuales, "pnorm", mean = res$media, sd = res$sd)
+    cat(sprintf("Kolmogorov-Smirnov: D = %.4f, p = %.4f\n", 
+                ks_test$statistic, ks_test$p.value))
+  })
+  
+  # ============================================
+  # MÓDULO 5: PRONÓSTILES DE DISEÑO - SERVER 
+  # ============================================
+  
+  # Observador para calcular pronóstiles - VERSIÓN CORREGIDA
+  observe({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    req(input$periodos_retorno)
+    
+    tryCatch({
+      ajustes <- ajustes_distribuciones()
+      if (length(ajustes) == 0) {
+        showNotification("Ajuste distribuciones primero", type = "warning")
+        return()
+      }
+      
+      # Períodos de retorno seleccionados
+      Tr <- as.numeric(input$periodos_retorno)
+      if (length(Tr) == 0) return()
+      
+      prob_no_excedencia <- 1 - 1/Tr
+      
+      # Inicializar data frame
+      pronostiles <- data.frame(
+        Periodo_Retorno_años = Tr,
+        Probabilidad_No_Excedencia = round(prob_no_excedencia, 4),
+        stringsAsFactors = FALSE
+      )
+      
+      # Determinar distribución a usar según selección
+      dist_usar <- input$dist_pronostiles
+      
+      # Si es "mejor", determinar cuál es la mejor distribución según AIC
+      if (dist_usar == "mejor") {
+        # Calcular AIC para cada distribución
+        aics <- c()
+        
+        if (!is.null(ajustes$gev)) {
+          tryCatch({
+            nllh <- ajustes$gev$nllh
+            loglik <- -nllh
+            k <- length(ajustes$gev$estimate)
+            aics <- c(aics, data.frame(dist = "gev", aic = 2*k - 2*loglik))
+          }, error = function(e) NULL)
+        }
+        
+        if (!is.null(ajustes$gumbel)) {
+          tryCatch({
+            nllh <- ajustes$gumbel$nllh
+            loglik <- -nllh
+            k <- length(ajustes$gumbel$estimate)
+            aics <- c(aics, data.frame(dist = "gumbel", aic = 2*k - 2*loglik))
+          }, error = function(e) NULL)
+        }
+        
+        # Encontrar la distribución con menor AIC
+        if (length(aics) > 0) {
+          dist_usar <- aics$dist[which.min(aics$aic)]
+        } else {
+          dist_usar <- "gev"  # Por defecto
+        }
+      }
+      
+      # Calcular pronóstiles según distribución seleccionada
+      datos <- maximos_anuales()$precipitacion_max
+      
+      if (dist_usar == "gev" && !is.null(ajustes$gev)) {
+        pronostiles$Pronostil_mm <- round(qevd(prob_no_excedencia,
+                                               loc = ajustes$gev$estimate[1],
+                                               scale = ajustes$gev$estimate[2],
+                                               shape = ajustes$gev$estimate[3],
+                                               type = "GEV"), 2)
+        
+      } else if (dist_usar == "gumbel" && !is.null(ajustes$gumbel)) {
+        pronostiles$Pronostil_mm <- round(qevd(prob_no_excedencia,
+                                               loc = ajustes$gumbel$estimate[1],
+                                               scale = ajustes$gumbel$estimate[2],
+                                               type = "Gumbel"), 2)
+        
+      } else if (dist_usar == "gamma" && !is.null(ajustes$gamma)) {
+        pronostiles$Pronostil_mm <- round(qgamma(prob_no_excedencia,
+                                                 shape = ajustes$gamma$estimate[1],
+                                                 rate = ajustes$gamma$estimate[2]), 2)
+        
+      } else if (dist_usar == "powerlindley" && !is.null(ajustes$powerlindley)) {
+        # Función cuantil para Power Lindley (aproximación numérica)
+        q_powlindley <- function(p, alpha, beta) {
+          f <- function(x) ppowlindley(x, alpha, beta) - p
+          tryCatch({
+            uniroot(f, c(0, 1000))$root
+          }, error = function(e) {
+            NA_real_
+          })
+        }
+        
+        pronostiles$Pronostil_mm <- round(sapply(prob_no_excedencia, function(p) {
+          q_powlindley(p, ajustes$powerlindley$estimate[1],
+                       ajustes$powerlindley$estimate[2])
+        }), 2)
+        
+      } else if (dist_usar == "zeghdoudi" && !is.null(ajustes$zeghdoudi)) {
+        # Función cuantil para Zeghdoudi (fórmula analítica)
+        pronostiles$Pronostil_mm <- round(
+          ajustes$zeghdoudi$estimate[2] / (-log(prob_no_excedencia))^(1/ajustes$zeghdoudi$estimate[1]), 
+          2
+        )
+        
+      } else {
+        showNotification(paste("Distribución", dist_usar, "no está ajustada"), 
+                         type = "warning", duration = 3)
+        return()
+      }
+      
+      # Calcular intervalos de confianza si está seleccionado
+      if (input$incluir_ic && nrow(pronostiles) > 0 && !is.null(pronostiles$Pronostil_mm)) {
+        alpha <- input$alpha_riesgo
+        
+        # Método simple: usar desviación estándar de los datos como aproximación
+        sd_datos <- sd(datos, na.rm = TRUE)
+        
+        # Factor Z para el nivel de confianza
+        z_factor <- qnorm(1 - alpha/2)
+        
+        # Calcular intervalos (aproximación)
+        pronostiles$IC_Inferior <- round(pronostiles$Pronostil_mm - z_factor * sd_datos/sqrt(length(datos)), 2)
+        pronostiles$IC_Superior <- round(pronostiles$Pronostil_mm + z_factor * sd_datos/sqrt(length(datos)), 2)
+        
+        # Asegurar que no sean negativos
+        pronostiles$IC_Inferior <- pmax(pronostiles$IC_Inferior, 0)
+      }
+      
+      # Guardar con metadatos
+      pronostiles_calculados(list(
+        tabla = pronostiles,
+        distribucion = dist_usar,
+        fecha_calculo = Sys.time(),
+        estacion = input$estacion
+      ))
+      
+      showNotification("Pronóstiles calculados correctamente", type = "success", duration = 3)
+      
+    }, error = function(e) {
+      showNotification(paste("Error calculando pronóstiles:", e$message), 
+                       type = "warning", duration = 5)
+      cat("Error en pronóstiles:", e$message, "\n")
+    })
+  })
+  
+  # Tabla de pronóstiles - VERSIÓN CORREGIDA
+  output$tabla_pronostiles <- renderDT({
+    req(pronostiles_calculados())
+    
+    datos <- pronostiles_calculados()$tabla
+    
+    if (is.null(datos) || nrow(datos) == 0) {
+      return(datatable(
+        data.frame(Mensaje = "No hay datos de pronóstiles calculados. Ajuste distribuciones y seleccione períodos de retorno."),
+        options = list(dom = 't')
+      ))
+    }
+    
+    # Preparar datos para mostrar
+    display_df <- datos
+    
+    # Renombrar columnas para mejor presentación
+    colnames(display_df) <- gsub("_", " ", colnames(display_df))
+    colnames(display_df) <- tools::toTitleCase(colnames(display_df))
+    
+    datatable(
+      display_df,
+      extensions = c('Buttons', 'Scroller'),
+      options = list(
+        dom = 'Bfrtip',
+        buttons = list(
+          list(extend = 'copy', title = NULL),
+          list(extend = 'csv', title = paste("Pronostiles", Sys.Date())),
+          list(extend = 'excel', title = paste("Pronostiles", Sys.Date())),
+          list(extend = 'pdf', title = paste("Pronostiles", Sys.Date())),
+          'print'
+        ),
+        scrollX = TRUE,
+        scrollY = "400px",
+        pageLength = 10,
+        language = list(
+          url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Spanish.json'
+        )
+      ),
+      rownames = FALSE,
+      caption = paste("Pronóstiles de Diseño -", 
+                      toupper(pronostiles_calculados()$distribucion),
+                      "- Estación:", pronostiles_calculados()$estacion)
+    ) %>%
+      formatRound(columns = which(sapply(display_df, is.numeric)), digits = 2) %>%
+      formatStyle(
+        'Pronostil Mm',
+        background = styleColorBar(display_df$`Pronostil Mm`, 'lightgreen'),
+        backgroundSize = '100% 90%',
+        backgroundRepeat = 'no-repeat',
+        backgroundPosition = 'center'
+      )
+  })
+  
+  # Gráfico IDF - VERSIÓN CORREGIDA
+  output$grafico_idf <- renderPlot({
+    req(pronostiles_calculados())
+    
+    datos <- pronostiles_calculados()$tabla
+    
+    if (is.null(datos) || nrow(datos) == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "No hay datos de pronóstiles para graficar")
+      return()
+    }
+    
+    # Crear gráfico base
+    p <- ggplot(datos, aes(x = Periodo_Retorno_años, y = Pronostil_mm)) +
+      geom_line(color = "blue", size = 1.5, alpha = 0.8) +
+      geom_point(color = "red", size = 3, shape = 16) +
+      labs(
+        title = paste("Curva Intensidad-Duración-Frecuencia (IDF)"),
+        subtitle = paste("Duración:", 24, "horas |",
+                         "Distribución:", toupper(pronostiles_calculados()$distribucion),
+                         "| Estación:", pronostiles_calculados()$estacion),
+        x = "Periodo de Retorno (años)",
+        y = paste("Precipitación Máxima (mm/", 24, "h)", sep = "")
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        plot.subtitle = element_text(hjust = 0.5, color = "gray50", size = 11),
+        axis.title = element_text(size = 11, face = "bold"),
+        legend.position = "bottom",
+        panel.grid.major = element_line(color = "gray90"),
+        panel.grid.minor = element_blank()
+      )
+    
+    # Añadir intervalos de confianza si existen
+    if ("IC_Inferior" %in% colnames(datos) && "IC_Superior" %in% colnames(datos)) {
+      p <- p + 
+        geom_ribbon(aes(ymin = IC_Inferior, ymax = IC_Superior),
+                    alpha = 0.2, fill = "lightblue") +
+        geom_line(aes(y = IC_Inferior), color = "gray", linetype = "dashed", size = 0.8) +
+        geom_line(aes(y = IC_Superior), color = "gray", linetype = "dashed", size = 0.8)
+    }
+    
+    # Aplicar escala logarítmica si está seleccionada
+    if (input$escala_log_idf) {
+      p <- p + 
+        scale_x_log10(breaks = unique(datos$Periodo_Retorno_años)) +
+        scale_y_log10() +
+        annotation_logticks()
+    }
+    
+    p
+  })
+  
+  # Mapa de riesgo - VERSIÓN SIMPLIFICADA (sin colores específicos)
+  output$mapa_riesgo <- renderPlot({
+    req(pronostiles_calculados())
+    
+    datos <- pronostiles_calculados()$tabla
+    
+    if (is.null(datos) || nrow(datos) == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "No hay datos para mapa de riesgo")
+      return()
+    }
+    
+    # Crear un gráfico simple de riesgo
+    plot(datos$Periodo_Retorno_años, datos$Pronostil_mm,
+         type = "o", 
+         col = "blue", 
+         lwd = 3, 
+         pch = 19, 
+         cex = 1.5,
+         xlab = "Periodo de Retorno (años)",
+         ylab = "Precipitación (mm)",
+         main = paste("Perfil de Riesgo -", pronostiles_calculados()$distribucion),
+         ylim = c(0, max(datos$Pronostil_mm) * 1.3),
+         panel.first = grid())
+    
+    # Añadir línea de referencia
+    abline(h = mean(datos$Pronostil_mm), col = "gray", lty = 2, lwd = 1.5)
+    
+    # Añadir leyenda
+    legend("topleft", 
+           legend = c("Pronóstiles", paste("Media:", round(mean(datos$Pronostil_mm), 1), "mm")),
+           col = c("blue", "gray"),
+           lty = c(1, 2), lwd = c(3, 1.5), pch = c(19, NA),
+           bg = "white", box.lwd = 0.5)
+  })
+  
+  # Gráfico de incertidumbre - VERSIÓN SIMPLIFICADA
+  output$grafico_incertidumbre <- renderPlot({
+    req(pronostiles_calculados())
+    
+    datos <- pronostiles_calculados()$tabla
+    
+    if (is.null(datos) || nrow(datos) < 2) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "Se necesitan al menos 2 períodos para análisis de incertidumbre")
+      return()
+    }
+    
+    # Crear secuencia más densa para suavizado
+    x_seq <- seq(min(datos$Periodo_Retorno_años), 
+                 max(datos$Periodo_Retorno_años), 
+                 length.out = 100)
+    
+    # Interpolar para obtener curva suave
+    y_smooth <- approx(datos$Periodo_Retorno_años, 
+                       datos$Pronostil_mm, 
+                       xout = x_seq)$y
+    
+    # Crear banda de incertidumbre (simulada)
+    banda_ancho <- 0.2  # 20% por defecto
+    y_upper <- y_smooth * (1 + banda_ancho)
+    y_lower <- y_smooth * (1 - banda_ancho)
+    
+    # Crear gráfico
+    plot(x_seq, y_smooth, type = "l", col = "blue", lwd = 2,
+         xlab = "Periodo de Retorno (años)",
+         ylab = "Precipitación (mm)",
+         main = paste("Análisis de Incertidumbre (", "20%", "bandas)", sep = ""),
+         ylim = range(c(y_lower, y_upper, datos$Pronostil_mm)),
+         log = ifelse(input$escala_log_idf, "x", ""))
+    
+    # Añadir banda de incertidumbre
+    polygon(c(x_seq, rev(x_seq)), c(y_upper, rev(y_lower)),
+            col = rgb(0, 0, 1, 0.2), border = NA)
+    
+    # Añadir datos originales
+    points(datos$Periodo_Retorno_años, datos$Pronostil_mm,
+           pch = 16, col = "red", cex = 1.2)
+    
+    # Añadir leyenda
+    legend("topleft", 
+           legend = c("Pronóstil estimado", "Banda 20%", "Datos calculados"),
+           col = c("blue", rgb(0, 0, 1, 0.5), "red"),
+           lwd = c(2, 10, NA),
+           pch = c(NA, NA, 16),
+           bg = "white", box.lwd = 0.5)
+  })
+  
+  # Recomendaciones para diseño - VERSIÓN CORREGIDA Y ROBUSTA
+  output$recomendaciones_diseno <- renderUI({
+    req(pronostiles_calculados())
+    
+    datos <- pronostiles_calculados()$tabla
+    
+    if (is.null(datos) || nrow(datos) == 0) {
+      return(tags$div(
+        class = "alert alert-warning",
+        icon("info-circle"),
+        tags$strong("Información: "),
+        "No hay datos de pronóstiles para generar recomendaciones. ",
+        "Ajuste distribuciones y seleccione períodos de retorno."
+      ))
+    }
+    
+    # Verificar que la columna Pronostil_mm existe y tiene valores numéricos
+    if (!"Pronostil_mm" %in% colnames(datos)) {
+      return(tags$div(
+        class = "alert alert-danger",
+        icon("exclamation-triangle"),
+        tags$strong("Error: "),
+        "La columna 'Pronostil_mm' no existe en los datos calculados."
+      ))
+    }
+    
+    # Filtrar valores no numéricos
+    datos_validos <- datos[!is.na(datos$Pronostil_mm) & is.numeric(datos$Pronostil_mm), ]
+    
+    if (nrow(datos_validos) == 0) {
+      return(tags$div(
+        class = "alert alert-danger",
+        icon("exclamation-triangle"),
+        tags$strong("Error: "),
+        "No hay valores numéricos válidos en los pronóstiles calculados."
+      ))
+    }
+    
+    # Encontrar pronóstil para 50 años (diseño típico)
+    # Si no hay exactamente 50, tomar el más cercano
+    if (50 %in% datos_validos$Periodo_Retorno_años) {
+      idx <- which(datos_validos$Periodo_Retorno_años == 50)
+    } else {
+      idx <- which.min(abs(datos_validos$Periodo_Retorno_años - 50))
+    }
+    
+    if (length(idx) == 0) idx <- 1
+    
+    pronostil_diseno <- datos_validos$Pronostil_mm[idx]
+    periodo_cercano <- datos_validos$Periodo_Retorno_años[idx]
+    
+    # Validar que el valor sea numérico y finito
+    if (is.na(pronostil_diseno) || !is.finite(pronostil_diseno) || pronostil_diseno <= 0) {
+      return(tags$div(
+        class = "alert alert-danger",
+        icon("exclamation-triangle"),
+        tags$strong("Error de cálculo: "),
+        paste("El pronóstil de diseño no es válido (valor:", pronostil_diseno, ").")
+      ))
+    }
+    
+    # Calcular dimensiones con validaciones
+    tryCatch({
+      # Cálculos seguros
+      diametro_drenaje <- round(sqrt(max(pronostil_diseno/50, 0.1)) * 1000, 0)
+      volumen_embalse <- round(pronostil_diseno * 100, 0)
+      altura_bordo <- round(pronostil_diseno/100 * 1.5, 1)
+      
+      # Asegurar valores mínimos razonables
+      diametro_drenaje <- max(diametro_drenaje, 300)  # Mínimo 300 mm
+      altura_bordo <- max(altura_bordo, 1.0)  # Mínimo 1.0 m
+      
+      tagList(
+        tags$div(
+          class = "alert alert-success",
+          tags$h4(icon("hard-hat"), " Especificaciones de Diseño"),
+          tags$hr(),
+          tags$table(
+            class = "table table-bordered",
+            tags$tr(
+              tags$td(tags$strong("Precipitación de diseño:")),
+              tags$td(paste(round(pronostil_diseno, 1), "mm"))
+            ),
+            tags$tr(
+              tags$td(tags$strong("Periodo de retorno:")),
+              tags$td(paste(periodo_cercano, "años"))
+            ),
+            tags$tr(
+              tags$td(tags$strong("Distribución:")),
+              tags$td(toupper(pronostiles_calculados()$distribucion))
+            ),
+            tags$tr(
+              tags$td(tags$strong("Estación:")),
+              tags$td(pronostiles_calculados()$estacion)
+            )
+          )
+        ),
+        
+        tags$div(
+          class = "alert alert-info",
+          tags$h5(icon("calculator"), " Cálculos de Diseño:"),
+          tags$table(
+            class = "table table-bordered",
+            tags$tr(
+              tags$td(tags$strong("Diámetro mínimo de drenaje:")),
+              tags$td(paste(diametro_drenaje, "mm"))
+            ),
+            tags$tr(
+              tags$td(tags$strong("Volumen útil de embalse:")),
+              tags$td(paste(volumen_embalse, "m³/ha"))
+            ),
+            tags$tr(
+              tags$td(tags$strong("Altura de bordo:")),
+              tags$td(paste(altura_bordo, "m"))
+            ),
+            tags$tr(
+              tags$td(tags$strong("Factor de seguridad recomendado:")),
+              tags$td("1.3")
+            )
+          )
+        ),
+        
+        tags$div(
+          class = "alert alert-warning",
+          tags$h5(icon("exclamation-triangle"), " Consideraciones:"),
+          tags$ul(
+            tags$li("Estos valores son orientativos y deben validarse con un ingeniero"),
+            tags$li("Considerar características específicas del terreno"),
+            tags$li("Realizar estudios geotécnicos complementarios"),
+            tags$li("Revisión estructural cada 5 años"),
+            tags$li("Monitoreo hidrometeorológico continuo")
+          )
+        )
+      )
+    }, error = function(e) {
+      tags$div(
+        class = "alert alert-danger",
+        icon("exclamation-triangle"),
+        tags$strong("Error en cálculos: "),
+        e$message,
+        tags$br(),
+        "Por favor, verifique los datos de entrada."
+      )
+    })
+  })
+  
+  # Descargar tabla de pronóstiles
+  output$descargar_pronostiles <- downloadHandler(
+    filename = function() {
+      paste("pronostiles_", 
+            pronostiles_calculados()$estacion, "_",
+            format(Sys.time(), "%Y%m%d_%H%M%S"), 
+            ".csv", sep = "")
+    },
+    content = function(file) {
+      req(pronostiles_calculados())
+      write.csv(pronostiles_calculados()$tabla, file, row.names = FALSE, 
+                fileEncoding = "UTF-8")
+    },
+    contentType = "text/csv"
+  )
+  
+  
+  # ============================================
+  # OBSERVADOR PARA CALCULAR RESIDUALES
+  # ============================================
+  
+  observeEvent(input$calcular_residuales, {
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    tryCatch({
+      # Mostrar notificación de inicio
+      id_notif <- showNotification(
+        "Calculando residuales...", 
+        type = "warning",
+        duration = 10
+      )
+      
+      ajustes <- ajustes_distribuciones()
+      datos <- maximos_anuales()$precipitacion_max
+      
+      # Usar GEV como distribución de referencia (o la primera disponible)
+      distribucion_ref <- NULL
+      ajuste_ref <- NULL
+      
+      if (!is.null(ajustes$gev)) {
+        distribucion_ref <- "gev"
+        ajuste_ref <- ajustes$gev
+      } else if (!is.null(ajustes$gumbel)) {
+        distribucion_ref <- "gumbel"
+        ajuste_ref <- ajustes$gumbel
+      } else if (!is.null(ajustes$gamma)) {
+        distribucion_ref <- "gamma"
+        ajuste_ref <- ajustes$gamma
+      } else {
+        # Cerrar notificación de inicio
+        if (!is.null(id_notif)) removeNotification(id_notif)
+        
+        # Mostrar notificación de advertencia
+        showNotification(
+          "No hay distribución ajustada para calcular residuales", 
+          type = "warning", 
+          duration = 3
+        )
+        return()
+      }
+      
+      # Función para calcular residuales
+      calcular_residuales_func <- function(tipo, datos, ajuste, dist_ref) {
+        residuales <- numeric(length(datos))
+        
+        if (tipo == "probability") {
+          # Residuales de probabilidad (transformados a cuantiles normales)
+          if (dist_ref == "gev") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 3) {
+              probs <- pevd(datos,
+                            loc = ajuste$estimate[1],
+                            scale = ajuste$estimate[2],
+                            shape = ajuste$estimate[3],
+                            type = "GEV")
+              residuales <- qnorm(probs)
+            }
+          } else if (dist_ref == "gumbel") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 2) {
+              probs <- pevd(datos,
+                            loc = ajuste$estimate[1],
+                            scale = ajuste$estimate[2],
+                            type = "Gumbel")
+              residuales <- qnorm(probs)
+            }
+          } else if (dist_ref == "gamma") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 2) {
+              probs <- pgamma(datos,
+                              shape = ajuste$estimate[1],
+                              rate = ajuste$estimate[2])
+              residuales <- qnorm(probs)
+            }
+          }
+          
+        } else if (tipo == "quantile") {
+          # Residuales de cuantil (diferencia entre cuantiles)
+          datos_ordenados <- sort(datos)
+          probs <- ppoints(length(datos))
+          
+          if (dist_ref == "gev") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 3) {
+              cuantiles_teoricos <- qevd(probs,
+                                         loc = ajuste$estimate[1],
+                                         scale = ajuste$estimate[2],
+                                         shape = ajuste$estimate[3],
+                                         type = "GEV")
+              residuales <- datos_ordenados - cuantiles_teoricos
+            }
+          } else if (dist_ref == "gumbel") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 2) {
+              cuantiles_teoricos <- qevd(probs,
+                                         loc = ajuste$estimate[1],
+                                         scale = ajuste$estimate[2],
+                                         type = "Gumbel")
+              residuales <- datos_ordenados - cuantiles_teoricos
+            }
+          } else if (dist_ref == "gamma") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 2) {
+              cuantiles_teoricos <- qgamma(probs,
+                                           shape = ajuste$estimate[1],
+                                           rate = ajuste$estimate[2])
+              residuales <- datos_ordenados - cuantiles_teoricos
+            }
+          }
+          
+          # Reordenar a su orden original
+          residuales <- residuales[order(order(datos))]
+          
+        } else if (tipo == "score") {
+          # Residuales de score (derivada de la log-verosimilitud)
+          if (dist_ref == "gev") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 3) {
+              # Para GEV: (x - loc) / scale
+              residuales <- (datos - ajuste$estimate[1]) / ajuste$estimate[2]
+            }
+          } else if (dist_ref == "gumbel") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 2) {
+              # Para Gumbel: (x - loc) / scale
+              residuales <- (datos - ajuste$estimate[1]) / ajuste$estimate[2]
+            }
+          } else if (dist_ref == "gamma") {
+            if (!is.null(ajuste$estimate) && length(ajuste$estimate) >= 2) {
+              # Para Gamma: (x - media) / desv_est
+              media <- ajuste$estimate[1] / ajuste$estimate[2]
+              desv_est <- sqrt(ajuste$estimate[1]) / ajuste$estimate[2]
+              residuales <- (datos - media) / desv_est
+            }
+          }
+        }
+        
+        return(residuales)
+      }
+      
+      # Calcular residuales
+      tipo_residual <- input$tipo_residual
+      residuales <- calcular_residuales_func(tipo_residual, datos, ajuste_ref, distribucion_ref)
+      
+      # Filtrar valores no finitos
+      residuales <- residuales[is.finite(residuales) & !is.na(residuales)]
+      
+      # Cerrar notificación de inicio
+      if (!is.null(id_notif)) removeNotification(id_notif)
+      
+      if (length(residuales) < 2) {
+        showNotification(
+          "Residuales insuficientes para análisis", 
+          type = "warning", 
+          duration = 3
+        )
+        return()
+      }
+      
+      # Guardar resultados
+      resultados_residuales(list(
+        residuales = residuales,
+        tipo = tipo_residual,
+        distribucion = distribucion_ref,
+        n = length(residuales),
+        media = mean(residuales, na.rm = TRUE),
+        sd = sd(residuales, na.rm = TRUE),
+        fecha_calculo = Sys.time()
+      ))
+      
+      # Marcar como calculado
+      datos_calculados(TRUE)
+      
+      # Notificación de éxito
+      showNotification(
+        paste("Residuales calculados:", length(residuales), "valores válidos"), 
+        type = "success", 
+        duration = 3
+      )
+      
+    }, error = function(e) {
+      # Cerrar notificación de inicio si existe
+      if (exists("id_notif") && !is.null(id_notif)) {
+        removeNotification(id_notif)
+      }
+      
+      # Mostrar notificación de error CORREGIDA
+      showNotification(
+        paste("Error calculando residuales:", e$message), 
+        type = "default",  # <-- CAMBIO CRÍTICO AQUÍ: usar "default" en lugar de "error"
+        duration = 5
+      )
+    })
+  })
+  
+  # ============================================
+  # MÓDULO 5: ANÁLISIS BOOTSTRAP - VERSIÓN CORREGIDA
+  # ============================================
+  
+  # Observador para ejecutar bootstrap - VERSIÓN CON VALIDACIÓN
+  observeEvent(input$ejecutar_bootstrap, {
+    # Verificar que hay datos cargados
+    if (is.null(maximos_anuales())) {
+      showNotification("No hay datos cargados. Cargue datos primero.", 
+                       type = "warning", duration = 5)
+      return()
+    }
+    
+    datos <- maximos_anuales()$precipitacion_max
+    
+    # Validación detallada de datos
+    if (length(datos) < 8) {
+      showNotification(
+        paste("Se necesitan al menos 8 datos para bootstrap. Datos disponibles:", length(datos)),
+        type = "warning",
+        duration = 10
+      )
+      return()
+    }
+    
+    # Mostrar notificación de inicio
+    id_notif <- showNotification(
+      paste("Ejecutando bootstrap con", length(datos), "datos..."),
+      type = "warning",
+      duration = NULL
+    )
+    
+    tryCatch({
+      n_boot <- as.numeric(input$n_bootstrap)
+      
+      # Validar número de réplicas
+      if (is.na(n_boot) || n_boot < 10) {
+        n_boot <- 100  # Valor por defecto
+      }
+      
+      boot_func <- function(data, indices) {
+        sample_data <- data[indices]
+        
+        # Filtrar datos válidos
+        sample_data <- sample_data[!is.na(sample_data)]
+        
+        if (length(sample_data) < 3) {
+          return(rep(NA, 2))  # Gumbel tiene 2 parámetros
+        }
+        
+        # Método de momentos para Gumbel (SIEMPRE FUNCIONA)
+        mean_val <- mean(sample_data)
+        sd_val <- sd(sample_data)
+        
+        # Fórmulas para Gumbel
+        scale_param <- sd_val * sqrt(6) / pi
+        location_param <- mean_val - 0.5772 * scale_param  # 0.5772 es constante de Euler
+        
+        return(c(location_param, scale_param))
+      }
+      
+      # PRUEBA RÁPIDA ANTES DEL BOOTSTRAP COMPLETO
+      # Probar con los datos originales
+      test_result <- boot_func(datos, 1:length(datos))
+      
+      if (all(is.na(test_result))) {
+        stop("El ajuste inicial falló. Verifique la distribución seleccionada.")
+      }
+      
+      # EJECUTAR BOOTSTRAP
+      # Usar bootstrap manual para mejor control
+      n_params <- length(test_result)
+      bootstrap_matrix <- matrix(NA, nrow = n_boot, ncol = n_params)
+      
+      success_count <- 0
+      for (i in 1:n_boot) {
+        indices <- sample(1:length(datos), size = length(datos), replace = TRUE)
+        result <- boot_func(datos, indices)
+        
+        if (!all(is.na(result))) {
+          bootstrap_matrix[i, ] <- result
+          success_count <- success_count + 1
+        }
+      }
+      
+      if (success_count == 0) {
+        stop("Todas las réplicas bootstrap fallaron. Intente con otra distribución.")
+      }
+      
+      if (success_count < 10) {
+        warning(paste("Solo", success_count, "réplicas exitosas. Los resultados pueden no ser confiables."))
+      }
+      
+      # Crear objeto boot compatible
+      boot_results <- list(
+        t = bootstrap_matrix,
+        t0 = apply(bootstrap_matrix, 2, function(x) mean(x[!is.na(x)])),
+        R = success_count,
+        data = datos,
+        seed = .Random.seed,
+        sim = "ordinary",
+        call = match.call(),
+        stype = "i",
+        strata = rep(1, length(datos))
+      )
+      class(boot_results) <- "boot"
+      
+      # Guardar resultados
+      resultados_bootstrap(list(
+        boot_obj = boot_results,
+        distribucion = input$dist_bootstrap,
+        n_replicas = n_boot,
+        replicas_validas = success_count,
+        fecha = Sys.time()
+      ))
+      
+      # Cerrar notificación
+      removeNotification(id_notif)
+      
+      # Notificación de éxito
+      showNotification(
+        paste("✓ Bootstrap completado:", success_count, "réplicas exitosas de", n_boot),
+        type = "success",
+        duration = 5
+      )
+      
+    }, error = function(e) {
+      # Cerrar notificación
+      if (exists("id_notif")) removeNotification(id_notif)
+      
+      # Mostrar error
+      error_msg <- paste("Error:", e$message)
+      
+      showNotification(
+        error_msg,
+        type = "warning",
+        duration = 10
+      )
+    })
+  })
+  
+  # ============================================
+  # OBSERVADOR PARA VERIFICAR DATOS
+  # ============================================
+  
+  observeEvent(input$verificar_datos, {
+    if (is.null(maximos_anuales())) {
+      showNotification("No hay datos cargados.", type = "warning", duration = 5)
+      return()
+    }
+    
+    datos <- maximos_anuales()$precipitacion_max
+    
+    showModal(modalDialog(
+      title = "Verificación de Datos para Bootstrap",
+      easyClose = TRUE,
+      footer = modalButton("Cerrar"),
+      
+      tags$div(
+        style = "font-family: monospace;",
+        tags$h4("Resumen de Datos:"),
+        tags$p(paste("Número de datos:", length(datos))),
+        tags$p(paste("Valores no NA:", sum(!is.na(datos)))),
+        tags$p(paste("Mínimo:", round(min(datos, na.rm = TRUE), 2))),
+        tags$p(paste("Máximo:", round(max(datos, na.rm = TRUE), 2))),
+        tags$p(paste("Media:", round(mean(datos, na.rm = TRUE), 2))),
+        tags$p(paste("Mediana:", round(median(datos, na.rm = TRUE), 2))),
+        tags$p(paste("Desv. Est.:", round(sd(datos, na.rm = TRUE), 2))),
+        
+        tags$hr(),
+        tags$h4("Requisitos para Bootstrap:"),
+        tags$p(if(length(datos) >= 8) "✓ Al menos 8 datos: CUMPLIDO" 
+               else paste("✗ Al menos 8 datos: FALTAN (tiene", length(datos), ")")),
+        tags$p(if(all(!is.na(datos))) "✓ Sin valores NA: CUMPLIDO" 
+               else "✗ Sin valores NA: HAY VALORES NA"),
+        tags$p(if(all(is.finite(datos))) "✓ Valores finitos: CUMPLIDO" 
+               else "✗ Valores finitos: HAY VALORES NO FINITOS"),
+        
+        tags$hr(),
+        tags$h4("Recomendaciones:"),
+        if(length(datos) < 10) {
+          tags$div(class = "alert alert-danger",
+                   "Se necesitan al menos 10 datos para bootstrap.")
+        } else if(length(datos) < 30) {
+          tags$div(class = "alert alert-warning",
+                   "Con menos de 30 datos, use máximo 100 réplicas bootstrap.")
+        } else {
+          tags$div(class = "alert alert-success",
+                   "Los datos son adecuados para bootstrap.")
+        }
+      )
+    ))
+  })
+  
+  # ============================================
+  # OUTPUT DE ESTADO DE DATOS
+  # ============================================
+  
+  output$estado_datos_bootstrap <- renderPrint({
+    if (is.null(maximos_anuales())) {
+      cat("No hay datos cargados.\n")
+      cat("Vaya a 'Carga de Datos' para procesar datos.\n")
+      return()
+    }
+    
+    datos <- maximos_anuales()$precipitacion_max
+    
+    cat("=== ESTADO DE DATOS ===\n")
+    cat("Datos disponibles:", length(datos), "\n")
+    cat("Mínimo:", round(min(datos, na.rm = TRUE), 2), "\n")
+    cat("Máximo:", round(max(datos, na.rm = TRUE), 2), "\n")
+    cat("Media:", round(mean(datos, na.rm = TRUE), 2), "\n")
+    
+    cat("\n=== REQUISITOS ===\n")
+    if (length(datos) >= 8) {
+      cat("✓ Mínimo 8 datos: CUMPLIDO\n")
+    } else {
+      cat("✗ Mínimo 8 datos: FALTAN (tiene", length(datos), ")\n")
+    }
+    
+    cat("\n=== RECOMENDACIÓN ===\n")
+    if (length(datos) >= 50) {
+      cat("Use hasta 1000 réplicas bootstrap\n")
+    } else if (length(datos) >= 20) {
+      cat("Use hasta 500 réplicas bootstrap\n")
+    } else if (length(datos) >= 8) {
+      cat("Use máximo 50 réplicas bootstrap\n")
+    } else {
+      cat("Cargue más datos para usar bootstrap\n")
+    }
+  })
+
+  
+  output$grafico_convergencia <- renderPlot({
+    req(resultados_bootstrap())
+    
+    boot_results <- resultados_bootstrap()
+    
+    if (is.null(boot_results) || ncol(boot_results$t) == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "No hay resultados bootstrap")
+      return()
+    }
+    
+    # Usar tamanio_muestra_bootstrap
+    tamanio <- if (!is.null(input$tamanio_muestra_bootstrap)) {
+      min(input$tamanio_muestra_bootstrap, boot_results$R)
+    } else {
+      min(100, boot_results$R)
+    }
+    
+    # Tomar el primer parámetro para convergencia
+    param_data <- boot_results$t[, 1]
+    param_data <- param_data[!is.na(param_data)]
+    
+    if (length(param_data) < 2) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "Datos insuficientes")
+      return()
+    }
+    
+    # Calcular medias acumulativas
+    medias_acum <- cumsum(param_data[1:tamanio]) / (1:tamanio)
+    errores <- numeric(tamanio)
+    
+    for (i in 1:tamanio) {
+      errores[i] <- sd(param_data[1:i]) / sqrt(i)
+    }
+    
+    # Crear gráfico
+    plot(1:tamanio, medias_acum, type = "l", lwd = 2, col = "blue",
+         xlab = "Número de Réplicas",
+         ylab = "Media Acumulativa",
+         main = "Convergencia Bootstrap")
+    
+    abline(h = mean(param_data, na.rm = TRUE), col = "red", lty = 2, lwd = 1.5)
+    
+    if (!is.null(input$error_estandar_bootstrap) && input$error_estandar_bootstrap) {
+      # Añadir bandas de error
+      lines(1:tamanio, medias_acum + 1.96 * errores, col = "gray", lty = 2)
+      lines(1:tamanio, medias_acum - 1.96 * errores, col = "gray", lty = 2)
+      
+      legend("topright", legend = c("Media", "Valor final", "IC 95%"),
+             col = c("blue", "red", "gray"), lty = c(1, 2, 2), lwd = c(2, 1.5, 1))
+    } else {
+      legend("topright", legend = c("Media", "Valor final"),
+             col = c("blue", "red"), lty = c(1, 2), lwd = c(2, 1.5))
+    }
+  })
+  
+  output$grafico_convergencia <- renderPlot({
+    req(resultados_bootstrap())
+    
+    boot_results <- resultados_bootstrap()
+    
+    if (is.null(boot_results) || ncol(boot_results$t) == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "No hay resultados bootstrap")
+      return()
+    }
+    
+    # Usar tamanio_muestra_bootstrap
+    tamanio <- if (!is.null(input$tamanio_muestra_bootstrap)) {
+      min(input$tamanio_muestra_bootstrap, boot_results$R)
+    } else {
+      min(100, boot_results$R)
+    }
+    
+    # Tomar el primer parámetro para convergencia
+    param_data <- boot_results$t[, 1]
+    param_data <- param_data[!is.na(param_data)]
+    
+    if (length(param_data) < 2) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "Datos insuficientes")
+      return()
+    }
+    
+    # Calcular medias acumulativas
+    medias_acum <- cumsum(param_data[1:tamanio]) / (1:tamanio)
+    errores <- numeric(tamanio)
+    
+    for (i in 1:tamanio) {
+      errores[i] <- sd(param_data[1:i]) / sqrt(i)
+    }
+    
+    # Crear gráfico
+    plot(1:tamanio, medias_acum, type = "l", lwd = 2, col = "blue",
+         xlab = "Número de Réplicas",
+         ylab = "Media Acumulativa",
+         main = "Convergencia Bootstrap")
+    
+    abline(h = mean(param_data, na.rm = TRUE), col = "red", lty = 2, lwd = 1.5)
+    
+    if (!is.null(input$error_estandar_bootstrap) && input$error_estandar_bootstrap) {
+      # Añadir bandas de error
+      lines(1:tamanio, medias_acum + 1.96 * errores, col = "gray", lty = 2)
+      lines(1:tamanio, medias_acum - 1.96 * errores, col = "gray", lty = 2)
+      
+      legend("topright", legend = c("Media", "Valor final", "IC 95%"),
+             col = c("blue", "red", "gray"), lty = c(1, 2, 2), lwd = c(2, 1.5, 1))
+    } else {
+      legend("topright", legend = c("Media", "Valor final"),
+             col = c("blue", "red"), lty = c(1, 2), lwd = c(2, 1.5))
+    }
+  })
+  
+  # ============================================
+  # OUTPUTS PARA BOOTSTRAP
+  # ============================================
+  
+  # 1. Gráfico de distribución bootstrap
+  output$distribucion_bootstrap <- renderPlot({
+    req(resultados_bootstrap())
+    
+    resultados <- resultados_bootstrap()
+    boot_obj <- resultados$boot_obj
+    
+    if (is.null(boot_obj) || ncol(boot_obj$t) == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "No hay resultados bootstrap disponibles")
+      return()
+    }
+    
+    # Determinar número de parámetros
+    n_params <- ncol(boot_obj$t)
+    param_names <- if (n_params == 3) {
+      c("Locación", "Escala", "Forma")
+    } else if (n_params == 2) {
+      c("Parámetro 1", "Parámetro 2")
+    } else {
+      paste("Parámetro", 1:n_params)
+    }
+    
+    # Crear gráfico según selección
+    if (input$tipo_grafico_bootstrap == "hist") {
+      # Histograma
+      par(mfrow = c(1, n_params))
+      
+      for (i in 1:n_params) {
+        param_data <- boot_obj$t[, i]
+        param_data <- param_data[!is.na(param_data)]
+        
+        if (length(param_data) < 2) {
+          plot(1, type = "n", xlab = "", ylab = "", 
+               main = paste(param_names[i], "\nDatos insuficientes"))
+          next
+        }
+        
+        hist(param_data, breaks = input$bins_bootstrap,
+             main = paste("Distribución Bootstrap\n", param_names[i]),
+             xlab = "Valor del Parámetro",
+             ylab = "Frecuencia",
+             col = "lightblue",
+             border = "black")
+        
+        # Añadir valor estimado original si está disponible
+        if (input$valores_estimados && !is.null(boot_obj$t0)) {
+          abline(v = boot_obj$t0[i], col = "red", lwd = 2, lty = 2)
+        }
+        
+        # Añadir intervalos de confianza
+        if (input$intervalos_confianza && length(param_data) > 10) {
+          ci <- quantile(param_data, probs = c(0.025, 0.975), na.rm = TRUE)
+          abline(v = ci[1], col = "blue", lty = 2, lwd = 1)
+          abline(v = ci[2], col = "blue", lty = 2, lwd = 1)
+          rect(ci[1], -1000, ci[2], 1000, 
+               col = rgb(0, 0, 1, 0.1), border = NA)
+        }
+      }
+      
+    } else if (input$tipo_grafico_bootstrap == "dens") {
+      # Densidad
+      par(mfrow = c(1, n_params))
+      
+      for (i in 1:n_params) {
+        param_data <- boot_obj$t[, i]
+        param_data <- param_data[!is.na(param_data)]
+        
+        if (length(param_data) < 2) {
+          plot(1, type = "n", xlab = "", ylab = "", 
+               main = paste(param_names[i], "\nDatos insuficientes"))
+          next
+        }
+        
+        dens <- density(param_data)
+        plot(dens, 
+             main = paste("Densidad Bootstrap\n", param_names[i]),
+             xlab = "Valor del Parámetro",
+             ylab = "Densidad",
+             col = "darkblue",
+             lwd = 2)
+        
+        polygon(dens$x, dens$y, col = rgb(0.2, 0.4, 0.8, 0.3))
+        
+        if (input$valores_estimados && !is.null(boot_obj$t0)) {
+          abline(v = boot_obj$t0[i], col = "red", lwd = 2, lty = 2)
+        }
+        
+        if (input$intervalos_confianza && length(param_data) > 10) {
+          ci <- quantile(param_data, probs = c(0.025, 0.975), na.rm = TRUE)
+          abline(v = ci[1], col = "blue", lty = 2, lwd = 1)
+          abline(v = ci[2], col = "blue", lty = 2, lwd = 1)
+        }
+      }
+      
+    } else {
+      # QQ-Plot
+      par(mfrow = c(1, n_params))
+      
+      for (i in 1:n_params) {
+        param_data <- boot_obj$t[, i]
+        param_data <- param_data[!is.na(param_data)]
+        
+        if (length(param_data) < 2) {
+          plot(1, type = "n", xlab = "", ylab = "", 
+               main = paste(param_names[i], "\nDatos insuficientes"))
+          next
+        }
+        
+        qqnorm(param_data,
+               main = paste("QQ-Plot Bootstrap\n", param_names[i]),
+               xlab = "Cuantiles Teóricos",
+               ylab = "Cuantiles Empíricos",
+               pch = 16, col = "steelblue", cex = 0.7)
+        qqline(param_data, col = "red", lwd = 2)
+      }
+    }
+    
+    par(mfrow = c(1, 1))
+  })
+  
+  # 2. Gráfico de convergencia (ya existe, pero mejoramos)
+  output$grafico_convergencia <- renderPlot({
+    req(resultados_bootstrap())
+    
+    resultados <- resultados_bootstrap()
+    boot_obj <- resultados$boot_obj
+    
+    if (is.null(boot_obj) || ncol(boot_obj$t) == 0) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "No hay resultados bootstrap")
+      return()
+    }
+    
+    # Usar primer parámetro para convergencia
+    param_data <- boot_obj$t[, 1]
+    param_data <- param_data[!is.na(param_data)]
+    
+    if (length(param_data) < 2) {
+      plot(1, type = "n", xlab = "", ylab = "", 
+           main = "Datos insuficientes")
+      return()
+    }
+    
+    # Calcular medias acumulativas
+    n <- length(param_data)
+    medias_acum <- cumsum(param_data) / (1:n)
+    
+    # Crear gráfico base
+    plot(1:n, medias_acum, type = "l", lwd = 2, col = "blue",
+         xlab = "Número de Réplicas Bootstrap",
+         ylab = "Media Acumulativa del Parámetro",
+         main = "Convergencia Bootstrap",
+         ylim = range(c(medias_acum, mean(param_data, na.rm = TRUE))))
+    
+    # Línea de valor final
+    if (input$linea_convergencia) {
+      abline(h = mean(param_data, na.rm = TRUE), col = "red", lty = 2, lwd = 1.5)
+    }
+    
+    # Bandas de error
+    if (input$bandas_error && n > 10) {
+      errores <- numeric(n)
+      for (i in 1:n) {
+        errores[i] <- sd(param_data[1:i]) / sqrt(i)
+      }
+      
+      lines(1:n, medias_acum + 1.96 * errores, col = "gray", lty = 2, lwd = 1)
+      lines(1:n, medias_acum - 1.96 * errores, col = "gray", lty = 2, lwd = 1)
+      
+      legend("topright", 
+             legend = c("Media acumulativa", "Valor final", "IC 95%"),
+             col = c("blue", "red", "gray"), 
+             lty = c(1, 2, 2), 
+             lwd = c(2, 1.5, 1))
+    } else {
+      legend("topright", 
+             legend = c("Media acumulativa", "Valor final"),
+             col = c("blue", "red"), 
+             lty = c(1, 2), 
+             lwd = c(2, 1.5))
+    }
+  })
+  
+  # 3. Tabla de estadísticas bootstrap
+  output$tabla_estadisticas_bootstrap <- renderTable({
+    req(resultados_bootstrap())
+    
+    resultados <- resultados_bootstrap()
+    boot_obj <- resultados$boot_obj
+    
+    if (is.null(boot_obj)) return(NULL)
+    
+    # Calcular estadísticas para cada parámetro
+    n_params <- ncol(boot_obj$t)
+    stats_table <- data.frame()
+    
+    for (i in 1:n_params) {
+      param_data <- boot_obj$t[, i]
+      param_data <- param_data[!is.na(param_data)]
+      
+      if (length(param_data) > 1) {
+        stats_table <- rbind(stats_table, data.frame(
+          Parámetro = paste("Param", i),
+          Media = round(mean(param_data), 4),
+          Mediana = round(median(param_data), 4),
+          SD = round(sd(param_data), 4),
+          `IC 95% Inferior` = round(quantile(param_data, 0.025, na.rm = TRUE), 4),
+          `IC 95% Superior` = round(quantile(param_data, 0.975, na.rm = TRUE), 4),
+          N = length(param_data)
+        ))
+      }
+    }
+    
+    stats_table
+  })
+  
+  # 4. Tabla de intervalos de confianza
+  output$tabla_intervalos_bootstrap <- renderDT({
+    req(resultados_bootstrap())
+    
+    resultados <- resultados_bootstrap()
+    boot_obj <- resultados$boot_obj
+    
+    if (is.null(boot_obj)) return(NULL)
+    
+    # Crear tabla de intervalos
+    n_params <- ncol(boot_obj$t)
+    conf_level <- input$confianza_bootstrap / 100
+    
+    intervals_table <- data.frame()
+    
+    for (i in 1:n_params) {
+      param_data <- boot_obj$t[, i]
+      param_data <- param_data[!is.na(param_data)]
+      
+      if (length(param_data) > 10) {
+        alpha <- 1 - conf_level
+        ci_lower <- quantile(param_data, alpha/2, na.rm = TRUE)
+        ci_upper <- quantile(param_data, 1 - alpha/2, na.rm = TRUE)
+        
+        intervals_table <- rbind(intervals_table, data.frame(
+          Parámetro = paste("Param", i),
+          Estimación = if (!is.null(boot_obj$t0[i])) round(boot_obj$t0[i], 4) else NA,
+          `IC Inferior` = round(ci_lower, 4),
+          `IC Superior` = round(ci_upper, 4),
+          Amplitud = round(ci_upper - ci_lower, 4),
+          Método = "Percentil",
+          Nivel = paste0(input$confianza_bootstrap, "%")
+        ))
+      }
+    }
+    
+    datatable(
+      intervals_table,
+      options = list(
+        pageLength = 10,
+        dom = 'Bfrtip',
+        buttons = c('copy', 'csv', 'excel'),
+        language = list(url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Spanish.json')
+      ),
+      rownames = FALSE,
+      caption = paste("Intervalos de Confianza Bootstrap -", resultados$distribucion)
+    )
+  })
+  
+  # 5. Información del bootstrap
+  output$info_bootstrap <- renderPrint({
+    req(resultados_bootstrap())
+    
+    resultados <- resultados_bootstrap()
+    
+    cat("=== INFORMACIÓN DEL BOOTSTRAP ===\n\n")
+    cat(sprintf("Distribución: %s\n", resultados$distribucion))
+    cat(sprintf("Réplicas solicitadas: %d\n", resultados$n_replicas))
+    cat(sprintf("Réplicas válidas: %d\n", resultados$replicas_validas))
+    cat(sprintf("Tasa de éxito: %.1f%%\n", 
+                resultados$replicas_validas/resultados$n_replicas * 100))
+    cat(sprintf("Fecha de ejecución: %s\n", format(resultados$fecha, "%Y-%m-%d %H:%M:%S")))
+    cat(sprintf("Nivel de confianza: %s%%\n", input$confianza_bootstrap))
+    
+    if (!is.null(resultados$boot_obj)) {
+      cat("\n=== RESUMEN ESTADÍSTICO ===\n")
+      for (i in 1:min(3, ncol(resultados$boot_obj$t))) {
+        param_data <- resultados$boot_obj$t[, i]
+        param_data <- param_data[!is.na(param_data)]
+        
+        if (length(param_data) > 1) {
+          cat(sprintf("\nParámetro %d:\n", i))
+          cat(sprintf("  Media: %.4f\n", mean(param_data)))
+          cat(sprintf("  Mediana: %.4f\n", median(param_data)))
+          cat(sprintf("  SD: %.4f\n", sd(param_data)))
+          cat(sprintf("  Mín: %.4f\n", min(param_data)))
+          cat(sprintf("  Máx: %.4f\n", max(param_data)))
+        }
+      }
+    }
+  })
+  
+  # ============================================
+  # MÓDULO 5: PRONÓSTILES DE DISEÑO
+  # ============================================
+  
+  # Calcular pronóstiles - VERSIÓN CORREGIDA
+  observe({
+    req(ajustes_distribuciones())
+    req(maximos_anuales())
+    
+    tryCatch({
+      ajustes <- ajustes_distribuciones()
+      if (length(ajustes) == 0) return()
+      
+      # Períodos de retorno seleccionados
+      Tr <- as.numeric(input$periodos_retorno)
+      prob_no_excedencia <- 1 - 1/Tr
+      
+      # Inicializar data frame
+      pronostiles <- data.frame(
+        Periodo_Retorno = Tr,
+        Probabilidad = round(prob_no_excedencia, 4)
+      )
+      
+      # Calcular pronóstiles para cada distribución
+      calcular_quantil <- function(dist, prob, ajuste) {
+        tryCatch({
+          switch(dist,
+            "gev" = {
+              if (!is.null(ajuste$gev) && length(ajuste$gev$estimate) >= 3) {
+                qevd(prob,
+                     loc = ajuste$gev$estimate[1],
+                     scale = ajuste$gev$estimate[2],
+                     shape = ajuste$gev$estimate[3],
+                     type = "GEV")
+              } else NA
+            },
+            "gumbel" = {
+              if (!is.null(ajuste$gumbel) && length(ajuste$gumbel$estimate) >= 2) {
+                qevd(prob,
+                     loc = ajuste$gumbel$estimate[1],
+                     scale = ajuste$gumbel$estimate[2],
+                     type = "Gumbel")
+              } else NA
+            },
+            "gamma" = {
+              if (!is.null(ajuste$gamma) && length(ajuste$gamma$estimate) >= 2) {
+                qgamma(prob,
+                       shape = ajuste$gamma$estimate[1],
+                       rate = ajuste$gamma$estimate[2])
+              } else NA
+            },
+            "powerlindley" = {
+              if (!is.null(ajuste$powerlindley) && length(ajuste$powerlindley$estimate) >= 2) {
+                # Búsqueda numérica para la función cuantil
+                alpha <- ajuste$powerlindley$estimate[1]
+                beta <- ajuste$powerlindley$estimate[2]
+                f <- function(x) ppowlindley(x, alpha, beta) - prob
+                uniroot(f, c(0, 1000), extendInt = "yes")$root
+              } else NA
+            },
+            "zeghdoudi" = {
+              if (!is.null(ajuste$zeghdoudi) && length(ajuste$zeghdoudi$estimate) >= 2) {
+                alpha <- ajuste$zeghdoudi$estimate[1]
+                lambda <- ajuste$zeghdoudi$estimate[2]
+                lambda / (-log(prob))^(1/alpha)
+              } else NA
+            },
+            NA
+          )
+        }, error = function(e) NA)
+      }
+      
+      # Calcular para cada distribución disponible
+      distribs <- c("gev", "gumbel", "gamma", "powerlindley", "zeghdoudi")
+      for (dist in distribs) {
+        if (!is.null(ajustes[[dist]])) {
+          pronostiles[[dist]] <- sapply(prob_no_excedencia, function(p) {
+            calcular_quantil(dist, p, ajustes)
+          })
+        }
+      }
+      
+      pronostiles_calculados(pronostiles)
+      
+    }, error = function(e) {
+      cat("Error calculando pronóstiles:", e$message, "\n")
+    })
+  })
+  
+  
+  # ============================================
+  # OUTPUTS ADICIONALES
+  # ============================================
+  
+  # Mensaje de bienvenida
+  output$mensaje_bienvenida <- renderUI({
+    if (estado_proceso() == "esperando") {
+      tagList(
+        h4("Bienvenido al Sistema de Modelado de Eventos Extremos"),
+        tags$p("Esta aplicación implementa metodologías avanzadas para el análisis estadístico de precipitaciones extremas en la región de Puno."),
+        tags$hr(),
+        tags$ol(
+          tags$li("Suba un archivo con datos de precipitación diaria"),
+          tags$li("Seleccione el rango de fechas y estación meteorológica"),
+          tags$li("Procese los datos para comenzar el análisis")
+        ),
+        tags$hr(),
+        tags$p(strong("Características principales:")),
+        tags$ul(
+          tags$li("Ajuste de distribuciones clásicas y de cola pesada"),
+          tags$li("Comparación de modelos mediante AIC/BIC"),
+          tags$li("Análisis de incertidumbre vía bootstrap"),
+          tags$li("Cálculo de pronóstiles de diseño"),
+          tags$li("Generación de reportes técnicos")
+        )
+      )
+    } else if (estado_proceso() == "listo") {
+      tagList(
+        h4(icon("check-circle"), " Datos procesados correctamente"),
+        tags$p("Puede continuar con el análisis exploratorio en las siguientes pestañas.")
+      )
+    } else if (estado_proceso() == "error") {
+      tagList(
+        h4(icon("exclamation-triangle"), " Error en el procesamiento"),
+        tags$p("Por favor, verifique el formato del archivo e intente nuevamente.")
+      )
+    }
+  })
+  
+  # Indicador de datos cargados
+  output$datos_cargados <- reactive({
+    !is.null(datos_originales())
+  })
+  outputOptions(output, "datos_cargados", suspendWhenHidden = FALSE)
+  
+  # Número de registros
+  output$n_registros <- renderText({
+    req(datos_originales())
+    format(nrow(datos_originales()), big.mark = ",")
+  })
+  
+  # Tabla de datos
+  output$tabla_datos <- renderDT({
+    req(datos_originales())
+    
+    datatable(
+      datos_originales() %>% head(100),
+      options = list(
+        pageLength = 10,
+        scrollX = TRUE,
+        language = list(url = '//cdn.datatables.net/plug-ins/1.10.11/i18n/Spanish.json')
+      ),
+      rownames = FALSE
+    )
+  })
+  
+  # Resumen de datos
+  output$resumen_datos <- renderTable({
+    req(datos_originales())
+    req(maximos_anuales())
+    
+    datos <- datos_originales()
+    maximos <- maximos_anuales()
+    
+    data.frame(
+      "Parámetro" = c("Archivo", "Estación", "Registros totales", 
+                      "Años analizados", "Período", 
+                      "Precipitación máxima registrada", 
+                      "Fecha de análisis"),
+      "Valor" = c(
+        input$archivo$name,
+        input$estacion,
+        format(nrow(datos), big.mark = ","),
+        nrow(maximos),
+        paste(min(datos$fecha), "a", max(datos$fecha)),
+        paste(round(max(maximos$precipitacion_max, na.rm = TRUE), 1), "mm"),
+        format(Sys.Date(), "%d/%m/%Y")
+      )
+    )
+  })
+  
+  # Recomendaciones para diseño
+  output$recomendaciones_diseno <- renderUI({
+    req(pronostiles_calculados())
+    
+    # Extraer pronóstico para 50 años
+    df <- pronostiles_calculados()
+    pronostilo_50 <- df$GEV[df$Periodo_Retorno == 50]  # Usar GEV como referencia
+    
+    tagList(
+      h4("Recomendaciones de Diseño Hidrológico"),
+      tags$hr(),
+      
+      tags$div(
+        class = "alert alert-warning",
+        tags$h5(icon("exclamation-triangle"), " Para período de retorno de 50 años:"),
+        tags$p("Precipitación de diseño estimada: ", 
+               strong(round(pronostilo_50, 1), " mm"))
+      ),
+      
+      h5("Dimensionamiento de estructuras:"),
+      tags$ul(
+        tags$li(strong("Drenaje pluvial:"), " Capacidad mínima de ", 
+                round(pronostilo_50 * 1.2, 1), " mm"),
+        tags$li(strong("Embalses:"), " Volumen útil para almacenar ",
+                round(pronostilo_50 * 0.7, 1), " mm"),
+        tags$li(strong("Bordos:"), " Altura libre mínima de ",
+                round(pronostilo_50/100 * 1.5, 2), " m")
+      ),
+      
+      h5("Medidas de seguridad:"),
+      tags$ul(
+        tags$li("Factor de seguridad recomendado: 1.3"),
+        tags$li("Revisión estructural cada 5 años"),
+        tags$li("Sistema de monitoreo hidrometeorológico"),
+        tags$li("Plan de contingencia para eventos > 100 años")
+      )
+    )
+  })
+}
+
+# 5. EJECUCIÓN DE LA APLICACIÓN
+shinyApp(ui, server)
